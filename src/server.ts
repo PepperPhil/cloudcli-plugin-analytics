@@ -3,11 +3,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { TranscriptStore, aggregate, RANGES, RangeKey, AnalyticsStats, Scope, Tool, TOOLS } from './collector.js';
 import { OpenCodeStore } from './opencode.js';
+import { CloudCliSessions } from './cloudcli.js';
 
 // The host passes only PATH, HOME, NODE_ENV and PLUGIN_NAME, so paths derive from HOME.
 const HOME = process.env.HOME || os.homedir();
 const CLAUDE_ROOT = path.join(HOME, '.claude', 'projects');
 const OPENCODE_DB = path.join(HOME, '.local', 'share', 'opencode', 'opencode.db');
+const CLOUDCLI_DB = path.join(HOME, '.cloudcli', 'auth.db');
 const CACHE_MS = 2_000;
 
 type ToolFilter = Tool | 'all';
@@ -15,10 +17,11 @@ type Response = AnalyticsStats & { tools: Record<Tool, { available: boolean; err
 
 const transcripts = new TranscriptStore(CLAUDE_ROOT);
 const opencode = new OpenCodeStore(OPENCODE_DB, RANGES['30d'].spanMs);
+const cloudcli = new CloudCliSessions(CLOUDCLI_DB);
 const cache = new Map<string, { at: number; data: Response }>();
 
 function getStats(range: RangeKey, scope: Scope, tool: ToolFilter): Response {
-  const key = `${range}|${scope.project ?? ''}|${scope.session ?? ''}|${tool}`;
+  const key = `${range}|${scope.project ?? ''}|${[scope.session ?? ''].flat().join(',')}|${tool}`;
   const now = Date.now();
   const hit = cache.get(key);
   if (hit && now - hit.at < CACHE_MS) return hit.data;
@@ -67,7 +70,10 @@ const server = http.createServer((req, res) => {
       return;
     }
     try {
-      res.end(JSON.stringify(getStats(rangeParam as RangeKey, { project, session }, tool)));
+      // Resolved on every request: a new session only gets its provider id
+      // once its first run starts.
+      const sessionIds = session ? cloudcli.resolve(session) : null;
+      res.end(JSON.stringify(getStats(rangeParam as RangeKey, { project, session: sessionIds }, tool)));
     } catch (err) {
       res.writeHead(500);
       res.end(JSON.stringify({ error: (err as Error).message }));

@@ -374,8 +374,11 @@ const ACTIVE_MS = 2 * 60_000;
 export interface Scope {
   /** Exact working directory. Subdirectories are separate projects in CloudCLI, so they don't match. */
   project?: string | null;
-  /** Root session id (Claude Code session or top-level OpenCode session). */
-  session?: string | null;
+  /**
+   * Root session id (Claude Code session or top-level OpenCode session), or
+   * every id one session is known by (e.g. a Claude session across resumes).
+   */
+  session?: string | string[] | null;
 }
 
 function trimSlash(p: string): string {
@@ -403,8 +406,9 @@ export function aggregate(
   const turnDurations: number[] = [];
   let promptCount = 0;
   const project = scope.project ? trimSlash(scope.project) : null;
+  const sessionIds = scope.session ? new Set([scope.session].flat()) : null;
   const inScope = (cwd: string, sessionId: string | null) =>
-    (!project || trimSlash(cwd) === project) && (!scope.session || sessionId === scope.session);
+    (!project || trimSlash(cwd) === project) && (!sessionIds || (sessionId !== null && sessionIds.has(sessionId)));
   const toolGroup = (tool: Tool) => {
     let g = tools.get(tool);
     if (!g) tools.set(tool, (g = Object.assign(newGroup(), { sessions: new Set<string>(), prompts: 0 })));

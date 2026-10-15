@@ -1,7 +1,7 @@
 {
   "name": "analytics",
   "displayName": "Analytics",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Real-time costs, cache hit rate, token usage and latency for Claude Code and OpenCode (incl. GitHub Copilot), read locally.",
   "author": "tobias",
   "icon": "icon.svg",
