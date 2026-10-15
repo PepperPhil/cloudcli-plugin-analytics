@@ -21,10 +21,10 @@ interface Stats {
   range: Range;
   generatedAt: number;
   bucketMs: number;
-  totals: Summary & { sessions: number; activeSessions: number; avgTurnMs: number | null; turns: number };
+  totals: Summary & { sessions: number; activeSessions: number; avgTurnMs: number | null; turns: number; prompts: number };
   lastHour: { cost: number; requests: number };
   series: { t: number; cost: number; tokens: number; cacheHitRate: number | null; latencyP50: number | null; requests: number }[];
-  byTool: (Summary & { tool: Tool; sessions: number; turns: number })[];
+  byTool: (Summary & { tool: Tool; sessions: number; prompts: number })[];
   byModel: (Summary & { model: string; tool: Tool })[];
   byProject: (Summary & { project: string; cwd: string })[];
   sessions: (Summary & {
@@ -206,7 +206,7 @@ function renderTools(c: ThemeColors, s: Stats): string {
   return card(c, 'by tool', table(c,
     ['tool', 'sessions', 'prompts', 'requests', 'tokens', 'cache hit', 'p50', 'cost'],
     s.byTool.map((t) => [
-      `${toolTag(c, t.tool)}${TOOL_NAMES[t.tool]}`, String(t.sessions), String(t.turns), String(t.requests),
+      `${toolTag(c, t.tool)}${TOOL_NAMES[t.tool]}`, String(t.sessions), String(t.prompts), String(t.requests),
       fmtTokens(t.totalTokens), hit(c, t.cacheHitRate), fmtMs(t.latency.p50), fmtCost(t.cost),
     ])));
 }
@@ -271,13 +271,18 @@ function renderRecent(c: ThemeColors, s: Stats): string {
 
 interface ViewState {
   range: Range;
-  scope: 'all' | 'project';
+  scope: 'all' | 'project' | 'session';
   tool: Tool | 'all';
   intervalMs: number;
 }
 
-function pill(c: ThemeColors, active: boolean, action: string, value: string, label: string, disabled = false): string {
-  return `<button data-action="${action}" data-value="${value}" ${disabled ? 'disabled' : ''}
+/** CloudCLI passes an opaque project id as `name`, so label projects by their directory. */
+function projectLabel(p: string): string {
+  return p.replace(/\/+$/, '').split('/').pop() || p || 'project';
+}
+
+function pill(c: ThemeColors, active: boolean, action: string, value: string, label: string, disabled = false, title = ''): string {
+  return `<button data-action="${action}" data-value="${value}" ${disabled ? 'disabled' : ''} ${title ? `title="${esc(title)}"` : ''}
     style="font:inherit;font-size:0.68rem;padding:3px 9px;border-radius:3px;cursor:${disabled ? 'not-allowed' : 'pointer'};
     border:1px solid ${active ? c.accent : c.border};background:${active ? c.accent : 'transparent'};
     color:${active ? c.bg : disabled ? c.border : c.text}">${label}</button>`;
@@ -297,7 +302,8 @@ function renderHeader(c: ThemeColors, v: ViewState, ctx: PluginContext, s: Stats
       <div style="display:flex;gap:4px">${TOOL_FILTERS.map(([t, l]) => pill(c, v.tool === t, 'tool', t, l)).join('')}</div>
       <div style="display:flex;gap:4px">
         ${pill(c, v.scope === 'all', 'scope', 'all', 'all projects')}
-        ${pill(c, v.scope === 'project', 'scope', 'project', ctx.project ? esc(ctx.project.name) : 'project', !ctx.project)}
+        ${pill(c, v.scope === 'project', 'scope', 'project', ctx.project ? esc(projectLabel(ctx.project.path)) : 'project', !ctx.project, ctx.project ? `Only this project directory: ${ctx.project.path}` : 'No project selected')}
+        ${pill(c, v.scope === 'session', 'scope', 'session', 'this session', !ctx.session, ctx.session ? `Only the open session: ${ctx.session.title}` : 'No session open')}
       </div>
       <div style="display:flex;gap:4px;align-items:center">
         <span style="font-size:0.62rem;color:${c.muted}">refresh</span>
@@ -350,9 +356,9 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     const my = ++seq;
     loading = true;
     const ctx = api.context;
-    const project = view.scope === 'project' && ctx.project ? ctx.project.path : '';
     const qs = new URLSearchParams({ range: view.range, tool: view.tool });
-    if (project) qs.set('project', project);
+    if (view.scope === 'project' && ctx.project?.path) qs.set('project', ctx.project.path);
+    if (view.scope === 'session' && ctx.session) qs.set('session', ctx.session.id);
     try {
       const data = (await api.rpc('GET', `/stats?${qs}`)) as Stats & { error?: string };
       if (my !== seq || !alive) return;
@@ -408,6 +414,7 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
   document.addEventListener('visibilitychange', onVisibility);
   const unsub = api.onContextChange(() => {
     if (view.scope === 'project' && !api.context.project) view.scope = 'all';
+    if (view.scope === 'session' && !api.context.session) view.scope = 'all';
     render();
     void load();
   });

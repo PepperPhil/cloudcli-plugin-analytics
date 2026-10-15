@@ -32,13 +32,14 @@ test('cacheHitRate is reads over all prompt tokens', () => {
 test('applyLine dedupes split assistant messages and measures latency', () => {
   const st = newFileState();
   const base = { sessionId: 's1', cwd: '/proj/a' };
-  applyLine(st, line({ ...base, type: 'user', uuid: 'u1', timestamp: '2026-10-15T10:00:00.000Z' }));
+  applyLine(st, line({ ...base, type: 'user', uuid: 'u1', timestamp: '2026-10-15T10:00:00.000Z', message: { content: 'hi' } }));
   applyLine(st, line({ type: 'api-request', ...base, id: 'r1', timestamp: '2026-10-15T10:00:00.500Z' }));
   const msg = { id: 'm1', model: 'claude-opus-5-5', usage };
   applyLine(st, line({ ...base, type: 'assistant', uuid: 'a1', parentUuid: 'u1', requestRef: 'r1', timestamp: '2026-10-15T10:00:03.000Z', message: msg }));
   applyLine(st, line({ ...base, type: 'assistant', uuid: 'a2', parentUuid: 'a1', timestamp: '2026-10-15T10:00:05.000Z', message: msg }));
   // No requestRef: falls back to the parent entry's timestamp.
-  applyLine(st, line({ ...base, type: 'user', uuid: 'u2', timestamp: '2026-10-15T10:01:00.000Z' }));
+  applyLine(st, line({ ...base, type: 'user', uuid: 'u2', timestamp: '2026-10-15T10:01:00.000Z', message: { content: [{ type: 'tool_result' }] } }));
+  applyLine(st, line({ ...base, type: 'user', isMeta: true, uuid: 'u3', timestamp: '2026-10-15T10:01:00.100Z', message: { content: [{ type: 'text' }] } }));
   applyLine(st, line({ ...base, type: 'assistant', uuid: 'a3', parentUuid: 'u2', timestamp: '2026-10-15T10:01:01.200Z', message: { ...msg, id: 'm2' } }));
   applyLine(st, line({ ...base, type: 'cost-state', totalCostUSD: 1.23 }));
   applyLine(st, line({ type: 'ai-title', sessionId: 's1', aiTitle: 'Hello' }));
@@ -51,15 +52,23 @@ test('applyLine dedupes split assistant messages and measures latency', () => {
   assert.equal(st.title, 'Hello');
 
   const now = Date.parse('2026-10-15T10:30:00.000Z');
-  const stats = aggregate([sourceFromTranscript('/x/s1.jsonl', st)], '1h', now, null);
+  const stats = aggregate([sourceFromTranscript('/x/s1.jsonl', st)], '1h', now);
   assert.equal(stats.totals.requests, 2);
+  // Only the typed prompt counts; tool results and meta entries don't.
+  assert.equal(stats.totals.prompts, 1);
+  assert.equal(stats.byTool[0].prompts, 1);
   assert.equal(stats.sessions[0].title, 'Hello');
   assert.equal(stats.sessions[0].reportedCost, 1.23);
   assert.equal(stats.totals.latency.p50, 1200);
   assert.equal(stats.series.reduce((a, p) => a + p.requests, 0), 2);
 
-  assert.equal(aggregate([sourceFromTranscript('/x/s1.jsonl', st)], '1h', now, '/proj/b').totals.requests, 0);
-  assert.equal(aggregate([sourceFromTranscript('/x/s1.jsonl', st)], '1h', now, '/proj').totals.requests, 2);
+  const src = [sourceFromTranscript('/x/s1.jsonl', st)];
+  assert.equal(aggregate(src, '1h', now, { project: '/proj/b' }).totals.requests, 0);
+  assert.equal(aggregate(src, '1h', now, { project: '/proj/a/' }).totals.requests, 2);
+  // A parent directory is a different CloudCLI project, so it must not include /proj/a.
+  assert.equal(aggregate(src, '1h', now, { project: '/proj' }).totals.requests, 0);
+  assert.equal(aggregate(src, '1h', now, { session: 's1' }).totals.requests, 2);
+  assert.equal(aggregate(src, '1h', now, { session: 's2' }).totals.requests, 0);
 });
 
 function ocRow(over: Partial<MessageRow>): MessageRow {
@@ -125,7 +134,7 @@ test('OpenCodeStore reads the sqlite db and rolls subagents into the root sessio
   assert.equal(sources.length, 2);
   assert.ok(sources.every((s) => s.sessionId === 'ses_root'));
 
-  const stats = aggregate(sources, '1h', now, null);
+  const stats = aggregate(sources, '1h', now);
   assert.equal(stats.totals.requests, 2);
   assert.equal(stats.sessions.length, 1);
   assert.equal(stats.sessions[0].tool, 'opencode');
@@ -133,13 +142,15 @@ test('OpenCodeStore reads the sqlite db and rolls subagents into the root sessio
   assert.equal(stats.sessions[0].reportedCost, 0.5);
   assert.equal(stats.sessions[0].subagentRequests, 1);
   assert.equal(stats.byTool[0].tool, 'opencode');
-  assert.equal(stats.byTool[0].turns, 1);
+  assert.equal(stats.byTool[0].prompts, 1);
+  // Session scope includes the subagent session's requests.
+  assert.equal(aggregate(sources, '1h', now, { session: 'ses_root' }).totals.requests, 2);
   assert.equal(stats.totals.avgTurnMs, 9_000);
   assert.equal(stats.recent.find((r) => r.model === 'github-copilot/claude-sonnet-5')?.latencyMs, 2_000);
   assert.ok(Math.abs(stats.totals.cost - 0.04) < 1e-9);
 
   // Second refresh with no changes keeps the same data.
-  assert.equal(aggregate(store.refresh(now), '1h', now, null).totals.requests, 2);
+  assert.equal(aggregate(store.refresh(now), '1h', now).totals.requests, 2);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -149,8 +160,8 @@ test('aggregate keeps Claude and OpenCode sessions apart', () => {
   const oc = parseMessage(ocRow({ session_id: 'same', time_created: Date.parse('2026-10-15T10:00:00.000Z') })).record!;
   const stats = aggregate([
     sourceFromTranscript('/x/same.jsonl', st),
-    { tool: 'opencode', sessionId: 'same', cwd: '/p', title: null, reportedCost: null, lastWriteMs: 0, subagent: false, requests: [oc], turns: [] },
-  ], '1h', Date.parse('2026-10-15T10:30:00.000Z'), null);
+    { tool: 'opencode', sessionId: 'same', cwd: '/p', title: null, reportedCost: null, lastWriteMs: 0, subagent: false, requests: [oc], turns: [], prompts: [] },
+  ], '1h', Date.parse('2026-10-15T10:30:00.000Z'));
   assert.equal(stats.sessions.length, 2);
   assert.deepEqual(stats.byTool.map((t) => t.tool), ['claude', 'opencode']);
 });

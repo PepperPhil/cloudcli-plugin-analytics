@@ -43,6 +43,7 @@ interface FileState {
   seenIds: Set<string>;
   requests: RequestRecord[];
   turns: { ts: number; durationMs: number }[];
+  prompts: number[];
   costState: CostState | null;
   sessionId: string | null;
   cwd: string | null;
@@ -64,6 +65,8 @@ export interface SessionSource {
   subagent: boolean;
   requests: RequestRecord[];
   turns: { ts: number; durationMs: number }[];
+  /** Timestamps of prompts the user typed (not tool results or subagent tasks). */
+  prompts: number[];
 }
 
 export const MAX_LATENCY_MS = 15 * 60_000;
@@ -84,6 +87,7 @@ function newFileState(): FileState {
     seenIds: new Set(),
     requests: [],
     turns: [],
+    prompts: [],
     costState: null,
     sessionId: null,
     cwd: null,
@@ -114,6 +118,12 @@ export function tokensFromUsage(usage: any): Tokens {
   };
 }
 
+/** A user entry is a typed prompt unless it only carries tool results. */
+function isTypedPrompt(content: unknown): boolean {
+  if (typeof content === 'string') return content.length > 0;
+  return Array.isArray(content) && content.some((b) => b?.type === 'text' || b?.type === 'image');
+}
+
 /** Apply one transcript line to the file state. Exported for tests. */
 export function applyLine(st: FileState, line: string): void {
   const head = line.slice(0, 48);
@@ -127,7 +137,8 @@ export function applyLine(st: FileState, line: string): void {
   if (!obj || typeof obj !== 'object') return;
   const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
   if (typeof obj.sessionId === 'string' && !st.sessionId) st.sessionId = obj.sessionId;
-  if (typeof obj.cwd === 'string') st.cwd = obj.cwd;
+  // A session belongs to the directory it started in, even if a shell `cd` later changes cwd.
+  if (typeof obj.cwd === 'string' && !st.cwd) st.cwd = obj.cwd;
   if (Number.isFinite(ts) && ts > st.lastTs) st.lastTs = ts;
   if (typeof obj.uuid === 'string' && Number.isFinite(ts)) st.uuidTs.set(obj.uuid, ts);
 
@@ -150,6 +161,10 @@ export function applyLine(st: FileState, line: string): void {
       if (obj.subtype === 'turn_duration' && Number.isFinite(ts) && typeof obj.durationMs === 'number') {
         st.turns.push({ ts, durationMs: obj.durationMs });
       }
+      return;
+    case 'user':
+      // turn_duration is only written by the interactive CLI, so count prompts from user entries.
+      if (!obj.isMeta && !obj.isSidechain && Number.isFinite(ts) && isTypedPrompt(obj.message?.content)) st.prompts.push(ts);
       return;
     case 'assistant':
       break;
@@ -174,7 +189,7 @@ export function applyLine(st: FileState, line: string): void {
     tool: 'claude',
     ts,
     sessionId: typeof obj.sessionId === 'string' ? obj.sessionId : st.sessionId ?? '',
-    cwd: typeof obj.cwd === 'string' ? obj.cwd : st.cwd ?? '',
+    cwd: st.cwd ?? '',
     model: msg.model,
     tokens,
     cost: estimateCost(msg.model, tokens, msg.usage.speed === 'fast'),
@@ -269,6 +284,7 @@ export function sourceFromTranscript(file: string, st: FileState): SessionSource
     subagent: file.includes('/subagents/'),
     requests: st.requests,
     turns: st.turns,
+    prompts: st.prompts,
   };
 }
 
@@ -333,10 +349,10 @@ export interface AnalyticsStats {
   generatedAt: number;
   windowStart: number;
   bucketMs: number;
-  totals: Summary & { sessions: number; activeSessions: number; avgTurnMs: number | null; turns: number };
+  totals: Summary & { sessions: number; activeSessions: number; avgTurnMs: number | null; turns: number; prompts: number };
   lastHour: { cost: number; requests: number };
   series: { t: number; cost: number; tokens: number; cacheHitRate: number | null; latencyP50: number | null; requests: number }[];
-  byTool: (Summary & { tool: Tool; sessions: number; turns: number })[];
+  byTool: (Summary & { tool: Tool; sessions: number; prompts: number })[];
   byModel: (Summary & { model: string; tool: Tool })[];
   byProject: (Summary & { project: string; cwd: string })[];
   sessions: (Summary & {
@@ -355,18 +371,29 @@ export interface AnalyticsStats {
 
 const ACTIVE_MS = 2 * 60_000;
 
+export interface Scope {
+  /** Exact working directory. Subdirectories are separate projects in CloudCLI, so they don't match. */
+  project?: string | null;
+  /** Root session id (Claude Code session or top-level OpenCode session). */
+  session?: string | null;
+}
+
+function trimSlash(p: string): string {
+  return p.length > 1 && p.endsWith('/') ? p.slice(0, -1) : p;
+}
+
 export function aggregate(
   sources: SessionSource[],
   range: RangeKey,
   nowMs: number,
-  projectFilter: string | null,
+  scope: Scope = {},
 ): AnalyticsStats {
   const { spanMs, bucketMs } = RANGES[range];
   const windowStart = Math.floor((nowMs - spanMs) / bucketMs) * bucketMs + bucketMs;
   const nBuckets = Math.round((Math.floor(nowMs / bucketMs) * bucketMs - windowStart) / bucketMs) + 1;
   const buckets = Array.from({ length: nBuckets }, newGroup);
   const total = newGroup();
-  const tools = new Map<Tool, Group & { sessions: Set<string>; turns: number }>();
+  const tools = new Map<Tool, Group & { sessions: Set<string>; prompts: number }>();
   const models = new Map<string, Group & { tool: Tool; model: string }>();
   const projects = new Map<string, Group>();
   const sessions = new Map<string, Group & { meta: AnalyticsStats['sessions'][number] }>();
@@ -374,11 +401,13 @@ export function aggregate(
   const recent: RequestRecord[] = [];
   const lastHour = { cost: 0, requests: 0 };
   const turnDurations: number[] = [];
-  const inProject = (cwd: string) =>
-    !projectFilter || cwd === projectFilter || cwd.startsWith(projectFilter.endsWith('/') ? projectFilter : projectFilter + '/');
+  let promptCount = 0;
+  const project = scope.project ? trimSlash(scope.project) : null;
+  const inScope = (cwd: string, sessionId: string | null) =>
+    (!project || trimSlash(cwd) === project) && (!scope.session || sessionId === scope.session);
   const toolGroup = (tool: Tool) => {
     let g = tools.get(tool);
-    if (!g) tools.set(tool, (g = Object.assign(newGroup(), { sessions: new Set<string>(), turns: 0 })));
+    if (!g) tools.set(tool, (g = Object.assign(newGroup(), { sessions: new Set<string>(), prompts: 0 })));
     return g;
   };
 
@@ -387,15 +416,19 @@ export function aggregate(
 
   for (const src of ordered) {
     const isSub = src.subagent;
+    const srcInScope = inScope(src.cwd ?? '', src.sessionId);
     for (const t of src.turns) {
-      if (t.ts >= windowStart && inProject(src.cwd ?? '')) {
-        turnDurations.push(t.durationMs);
-        toolGroup(src.tool).turns += 1;
+      if (t.ts >= windowStart && srcInScope) turnDurations.push(t.durationMs);
+    }
+    for (const ts of src.prompts) {
+      if (ts >= windowStart && srcInScope) {
+        promptCount += 1;
+        toolGroup(src.tool).prompts += 1;
       }
     }
     for (const r of src.requests) {
       const key = `${r.tool}:${r.id}`;
-      if (r.ts < windowStart || r.ts > nowMs + 60_000 || seen.has(key) || !inProject(r.cwd)) continue;
+      if (r.ts < windowStart || r.ts > nowMs + 60_000 || seen.has(key) || !inScope(r.cwd, r.sessionId)) continue;
       seen.add(key);
       addToGroup(total, r);
       const bi = Math.min(nBuckets - 1, Math.max(0, Math.floor((r.ts - windowStart) / bucketMs)));
@@ -471,6 +504,7 @@ export function aggregate(
       sessions: sessions.size,
       activeSessions: sessionList.filter((s) => s.active).length,
       turns: turnDurations.length,
+      prompts: promptCount,
       avgTurnMs: turnDurations.length ? turnDurations.reduce((a, b) => a + b, 0) / turnDurations.length : null,
     },
     lastHour,
@@ -487,7 +521,7 @@ export function aggregate(
     }),
     byTool: TOOLS.filter((t) => tools.has(t)).map((tool) => {
       const g = tools.get(tool)!;
-      return { tool, ...summarize(g), sessions: g.sessions.size, turns: g.turns };
+      return { tool, ...summarize(g), sessions: g.sessions.size, prompts: g.prompts };
     }),
     byModel: [...models.values()].map((g) => ({ model: g.model, tool: g.tool, ...summarize(g) })).sort(rankByCost),
     byProject: [...projects.entries()]

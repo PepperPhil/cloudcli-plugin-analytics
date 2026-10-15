@@ -1,7 +1,7 @@
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { TranscriptStore, aggregate, RANGES, RangeKey, AnalyticsStats, Tool, TOOLS } from './collector.js';
+import { TranscriptStore, aggregate, RANGES, RangeKey, AnalyticsStats, Scope, Tool, TOOLS } from './collector.js';
 import { OpenCodeStore } from './opencode.js';
 
 // The host passes only PATH, HOME, NODE_ENV and PLUGIN_NAME, so paths derive from HOME.
@@ -17,8 +17,8 @@ const transcripts = new TranscriptStore(CLAUDE_ROOT);
 const opencode = new OpenCodeStore(OPENCODE_DB, RANGES['30d'].spanMs);
 const cache = new Map<string, { at: number; data: Response }>();
 
-function getStats(range: RangeKey, project: string | null, tool: ToolFilter): Response {
-  const key = `${range}|${project ?? ''}|${tool}`;
+function getStats(range: RangeKey, scope: Scope, tool: ToolFilter): Response {
+  const key = `${range}|${scope.project ?? ''}|${scope.session ?? ''}|${tool}`;
   const now = Date.now();
   const hit = cache.get(key);
   if (hit && now - hit.at < CACHE_MS) return hit.data;
@@ -27,7 +27,7 @@ function getStats(range: RangeKey, project: string | null, tool: ToolFilter): Re
     ...(tool === 'all' || tool === 'opencode' ? opencode.refresh(now) : []),
   ];
   const data: Response = {
-    ...aggregate(sources, range, now, project),
+    ...aggregate(sources, range, now, scope),
     tools: {
       claude: { available: true, error: null },
       opencode: { available: opencode.available(), error: opencode.error },
@@ -44,6 +44,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && url.pathname === '/stats') {
     const rangeParam = url.searchParams.get('range') ?? '24h';
     const project = url.searchParams.get('project') || null;
+    const session = url.searchParams.get('session') || null;
     const tool = (url.searchParams.get('tool') ?? 'all') as ToolFilter;
     if (!(rangeParam in RANGES)) {
       res.writeHead(400);
@@ -60,8 +61,13 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: 'project must be an absolute path' }));
       return;
     }
+    if (session !== null && !/^[\w-]{1,128}$/.test(session)) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'session must be a session id' }));
+      return;
+    }
     try {
-      res.end(JSON.stringify(getStats(rangeParam as RangeKey, project, tool)));
+      res.end(JSON.stringify(getStats(rangeParam as RangeKey, { project, session }, tool)));
     } catch (err) {
       res.writeHead(500);
       res.end(JSON.stringify({ error: (err as Error).message }));
@@ -86,7 +92,7 @@ server.listen(0, '127.0.0.1', () => {
   // Warm the parse cache after signalling readiness (host waits max 10s for the ready line).
   setTimeout(() => {
     try {
-      getStats('30d', null, 'all');
+      getStats('30d', {}, 'all');
     } catch {
       /* first request will surface the error */
     }

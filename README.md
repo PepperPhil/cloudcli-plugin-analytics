@@ -25,7 +25,10 @@ models, in a CloudCLI tab:
   dot. Subagent requests are counted with their parent session.
 
 Ranges are 1h, 24h, 7d and 30d. Tool filter is all, Claude Code or OpenCode.
-Scope is either all projects or the selected project. Auto-refresh is 5s, 15s,
+Scope is all projects, the selected project or the open session. A session
+belongs to the directory it was started in, and the project scope matches that
+directory exactly, so nested projects (e.g. `~/app` inside `~`) stay separate.
+Auto-refresh is 5s, 15s,
 1m or off, and pauses while the tab is hidden. Everything is read locally;
 nothing leaves the machine.
 
@@ -81,7 +84,7 @@ proxies `api.rpc()` calls to it. It uses no secrets. Because the host passes
 only `PATH`, `HOME`, `NODE_ENV` and `PLUGIN_NAME`, all data paths are derived
 from `HOME`.
 
-- `GET /stats?range=1h|24h|7d|30d[&tool=all|claude|opencode][&project=/abs/path]`
+- `GET /stats?range=1h|24h|7d|30d[&tool=all|claude|opencode][&project=/abs/path][&session=id]`
 - `GET /health`
 
 ### Claude Code
@@ -94,7 +97,9 @@ selected range.
 |---|---|
 | tokens / cost | `assistant.message.usage` (deduped by `message.id`) |
 | latency | `assistant` timestamp − matching `api-request` (`requestRef`), else − parent entry timestamp |
-| turn duration | `system` / `turn_duration` |
+| turn duration | `system` / `turn_duration` (written by the interactive CLI only) |
+| prompts | `user` entries with text or image content (not tool results, meta or subagent entries) |
+| project | first `cwd` in the transcript |
 | reported cost | latest `cost-state.totalCostUSD` (resets when a session is resumed) |
 | session title | `ai-title`, else `last-prompt` |
 
@@ -112,7 +117,9 @@ the last poll are read. The last 30 days are kept in memory.
 | tokens / cost | assistant `message.data.tokens` / `.cost` (OpenCode's own estimate) |
 | model | `providerID/modelID`, e.g. `github-copilot/gpt-5.6-terra` (shown as `copilot/…`) |
 | latency | first non-`step-start` `part` − message creation |
-| turn duration / prompts | user message → last completed assistant reply to it |
+| turn duration | user message → last completed assistant reply to it |
+| prompts | user messages in root sessions |
+| project | `session.directory` |
 | reported cost | `session.cost` |
 | subagents | sessions with `parent_id` roll up into the root session |
 

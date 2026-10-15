@@ -214,13 +214,17 @@ export class OpenCodeStore {
         }
       }
       const turns: SessionSource['turns'] = [];
+      const prompts: number[] = [];
       const requests: RequestRecord[] = [];
       for (const m of msgs) {
+        // User messages in subagent sessions are task prompts written by the parent agent.
+        if (m.role === 'user' && root === sid) prompts.push(m.created);
         const end = m.role === 'user' ? done.get(m.id) : undefined;
         if (end !== undefined && end > m.created) turns.push({ ts: m.created, durationMs: end - m.created });
         if (m.record) {
           m.record.sessionId = root;
-          if (!m.record.cwd) m.record.cwd = s?.cwd ?? '';
+          // Attribute to the session's directory, matching how CloudCLI groups sessions into projects.
+          m.record.cwd = s?.cwd || m.record.cwd;
           requests.push(m.record);
         }
       }
@@ -234,6 +238,7 @@ export class OpenCodeStore {
         subagent: root !== sid,
         requests,
         turns,
+        prompts,
       });
     }
     return out;
