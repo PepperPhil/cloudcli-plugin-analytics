@@ -1,130 +1,76 @@
 import http from 'node:http';
-import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { TranscriptStore, aggregate, RANGES, RangeKey, AnalyticsStats, Tool, TOOLS } from './collector.js';
+import { OpenCodeStore } from './opencode.js';
 
-// ── Types ──────────────────────────────────────────────────────────────
+// The host passes only PATH, HOME, NODE_ENV and PLUGIN_NAME, so paths derive from HOME.
+const HOME = process.env.HOME || os.homedir();
+const CLAUDE_ROOT = path.join(HOME, '.claude', 'projects');
+const OPENCODE_DB = path.join(HOME, '.local', 'share', 'opencode', 'opencode.db');
+const CACHE_MS = 2_000;
 
-interface FileInfo {
-  full: string;
-  rel: string;
-  ext: string;
-  size: number;
-  mtime: number;
-}
+type ToolFilter = Tool | 'all';
+type Response = AnalyticsStats & { tools: Record<Tool, { available: boolean; error: string | null }> };
 
-interface ProjectStats {
-  totalFiles: number;
-  totalLines: number;
-  totalSize: number;
-  byExtension: [string, number][];
-  largest: { name: string; size: number }[];
-  recent: { name: string; mtime: number }[];
-}
+const transcripts = new TranscriptStore(CLAUDE_ROOT);
+const opencode = new OpenCodeStore(OPENCODE_DB, RANGES['30d'].spanMs);
+const cache = new Map<string, { at: number; data: Response }>();
 
-// ── Constants ──────────────────────────────────────────────────────────
-
-const TEXT_EXTS = new Set([
-  '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.vue', '.svelte', '.astro',
-  '.css', '.scss', '.sass', '.less',
-  '.html', '.htm', '.xml', '.svg',
-  '.json', '.yaml', '.yml', '.toml', '.ini',
-  '.md', '.mdx', '.txt', '.rst',
-  '.py', '.rb', '.go', '.rs', '.java', '.c', '.cpp', '.h', '.hpp', '.cs',
-  '.sh', '.bash', '.zsh', '.fish',
-  '.sql', '.graphql', '.gql',
-]);
-
-const SKIP_DIRS = new Set([
-  'node_modules', '.git', 'dist', 'build', '.next', '.nuxt',
-  'coverage', '.cache', '__pycache__', '.venv', 'venv',
-  'target', 'vendor', '.turbo', 'out', '.output', 'tmp',
-]);
-
-// ── Filesystem helpers ─────────────────────────────────────────────────
-
-function scan(dir: string, max = 5000): FileInfo[] {
-  const files: FileInfo[] = [];
-  (function walk(d: string, depth: number): void {
-    if (depth > 6 || files.length >= max) return;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(d, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      if (files.length >= max) break;
-      if (e.name.startsWith('.') && e.name !== '.env') continue;
-      const full = path.join(d, e.name);
-      if (e.isDirectory()) {
-        if (!SKIP_DIRS.has(e.name)) walk(full, depth + 1);
-      } else if (e.isFile()) {
-        try {
-          const stat = fs.statSync(full);
-          files.push({
-            full,
-            rel: path.relative(dir, full),
-            ext: path.extname(e.name).toLowerCase() || '(none)',
-            size: stat.size,
-            mtime: stat.mtimeMs,
-          });
-        } catch {
-          /* skip unreadable */
-        }
-      }
-    }
-  })(dir, 0);
-  return files;
-}
-
-function countLines(full: string, size: number): number {
-  if (size > 256 * 1024) return 0; // skip large files
-  try {
-    return (fs.readFileSync(full, 'utf-8').match(/\n/g) || []).length + 1;
-  } catch {
-    return 0;
-  }
-}
-
-function getStats(projectPath: string): ProjectStats {
-  if (!projectPath || !path.isAbsolute(projectPath)) throw new Error('Invalid path');
-  if (!fs.existsSync(projectPath)) throw new Error('Path does not exist');
-
-  const files = scan(projectPath);
-  const byExt: Record<string, number> = {};
-  let totalLines = 0;
-  let totalSize = 0;
-
-  for (const f of files) {
-    byExt[f.ext] = (byExt[f.ext] || 0) + 1;
-    totalSize += f.size;
-    if (TEXT_EXTS.has(f.ext)) totalLines += countLines(f.full, f.size);
-  }
-
-  return {
-    totalFiles: files.length,
-    totalLines,
-    totalSize,
-    byExtension: Object.entries(byExt).sort((a, b) => b[1] - a[1]).slice(0, 12),
-    largest: [...files].sort((a, b) => b.size - a.size).slice(0, 6).map((f) => ({ name: f.rel, size: f.size })),
-    recent: [...files].sort((a, b) => b.mtime - a.mtime).slice(0, 6).map((f) => ({ name: f.rel, mtime: f.mtime })),
+function getStats(range: RangeKey, project: string | null, tool: ToolFilter): Response {
+  const key = `${range}|${project ?? ''}|${tool}`;
+  const now = Date.now();
+  const hit = cache.get(key);
+  if (hit && now - hit.at < CACHE_MS) return hit.data;
+  const sources = [
+    ...(tool === 'all' || tool === 'claude' ? transcripts.refresh(now - RANGES[range].spanMs) : []),
+    ...(tool === 'all' || tool === 'opencode' ? opencode.refresh(now) : []),
+  ];
+  const data: Response = {
+    ...aggregate(sources, range, now, project),
+    tools: {
+      claude: { available: true, error: null },
+      opencode: { available: opencode.available(), error: opencode.error },
+    },
   };
+  cache.set(key, { at: now, data });
+  return data;
 }
-
-// ── HTTP server ────────────────────────────────────────────────────────
 
 const server = http.createServer((req, res) => {
   res.setHeader('Content-Type', 'application/json');
+  const url = new URL(req.url ?? '/', 'http://localhost');
 
-  if (req.method === 'GET' && req.url?.startsWith('/stats')) {
-    try {
-      const { searchParams } = new URL(req.url, 'http://localhost');
-      const stats = getStats(searchParams.get('path') ?? '');
-      res.end(JSON.stringify(stats));
-    } catch (err) {
+  if (req.method === 'GET' && url.pathname === '/stats') {
+    const rangeParam = url.searchParams.get('range') ?? '24h';
+    const project = url.searchParams.get('project') || null;
+    const tool = (url.searchParams.get('tool') ?? 'all') as ToolFilter;
+    if (!(rangeParam in RANGES)) {
       res.writeHead(400);
+      res.end(JSON.stringify({ error: `range must be one of ${Object.keys(RANGES).join(', ')}` }));
+      return;
+    }
+    if (tool !== 'all' && !TOOLS.includes(tool)) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: `tool must be one of all, ${TOOLS.join(', ')}` }));
+      return;
+    }
+    if (project !== null && !path.isAbsolute(project)) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'project must be an absolute path' }));
+      return;
+    }
+    try {
+      res.end(JSON.stringify(getStats(rangeParam as RangeKey, project, tool)));
+    } catch (err) {
+      res.writeHead(500);
       res.end(JSON.stringify({ error: (err as Error).message }));
     }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/health') {
+    res.end(JSON.stringify({ ok: true, claudeRoot: CLAUDE_ROOT, opencodeDb: OPENCODE_DB, opencodeError: opencode.error }));
     return;
   }
 
@@ -135,7 +81,14 @@ const server = http.createServer((req, res) => {
 server.listen(0, '127.0.0.1', () => {
   const addr = server.address();
   if (addr && typeof addr !== 'string') {
-    // Signal readiness to the host — this JSON line is required
     console.log(JSON.stringify({ ready: true, port: addr.port }));
   }
+  // Warm the parse cache after signalling readiness (host waits max 10s for the ready line).
+  setTimeout(() => {
+    try {
+      getStats('30d', null, 'all');
+    } catch {
+      /* first request will surface the error */
+    }
+  }, 0);
 });

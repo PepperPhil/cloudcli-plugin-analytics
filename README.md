@@ -1,205 +1,143 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/siteboon/claudecodeui/main/public/logo.svg" alt="CloudCLI" width="64" height="64">
-  <h1>CloudCLI Plugin Starter — Project Stats</h1>
-  <p>A starter plugin for <a href="https://cloudcli.ai">CloudCLI Cloud</a> and <a href="https://github.com/siteboon/claudecodeui">CloudCLI UI</a></p>
+  <h1>Analytics — CloudCLI Plugin</h1>
+  <p>Cost, cache, token and latency analytics for Claude Code and OpenCode in <a href="https://github.com/siteboon/claudecodeui">CloudCLI UI</a></p>
 </div>
 
 <p align="center">
-  <a href="https://cloudcli.ai">CloudCLI Cloud</a> · <a href="https://discord.gg/buxwujPNRE">Discord</a> · <a href="https://github.com/siteboon/claudecodeui/issues">Bug Reports</a> · <a href="https://cloudcli.ai/docs/plugin-overview">Plugin Docs</a>
-</p>
-
-<p align="center">
-  <a href="https://cloudcli.ai"><img src="https://img.shields.io/badge/☁️_CloudCLI_Cloud-Try_Now-0066FF?style=for-the-badge" alt="CloudCLI Cloud"></a>
-  <a href="https://discord.gg/buxwujPNRE"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join our Discord"></a>
+  <a href="https://cloudcli.ai/docs/plugin-overview">Plugin Docs</a> · Forked from <a href="https://github.com/cloudcli-ai/cloudcli-plugin-starter">cloudcli-plugin-starter</a>
 </p>
 
 ---
-<p align="center">
-  <img src="project-stats.png" alt="Project Stats Screenshot" width="700">
-</p>
 
-This plugin scans the currently selected project and shows file counts, lines of code, a file-type breakdown chart, largest files, and recently modified files.
+A real-time monitor for Claude Code and OpenCode, including GitHub Copilot
+models, in a CloudCLI tab:
 
-It demonstrates the full plugin API — frontend rendering with live context updates and a Node.js backend server with RPC communication. Fork this repo to build your own plugin.
+- **Cost:** $ for the selected range and the last hour, per tool, model,
+  project and session. The session table also shows each tool's own session
+  cost counter.
+- **Cache hit rate:** `cache_read / (input + cache writes + cache reads)`,
+  overall, per bucket, per tool, per model and per session, color-coded.
+- **Tokens:** input, output (incl. reasoning), cache writes and cache reads.
+- **Latency:** p50, p95 and average from the time a request is sent until the
+  first response block is written, plus average turn duration.
+- **Live sessions:** sessions written to in the last 2 minutes get a green
+  dot. Subagent requests are counted with their parent session.
 
-For a complete guide to the plugin system, see the [Plugin Overview](https://cloudcli.ai/docs/plugin-overview).
+Ranges are 1h, 24h, 7d and 30d. Tool filter is all, Claude Code or OpenCode.
+Scope is either all projects or the selected project. Auto-refresh is 5s, 15s,
+1m or off, and pauses while the tab is hidden. Everything is read locally;
+nothing leaves the machine.
+
+## Requirements
+
+- Node.js ≥ 22.5 for OpenCode tracking. It uses the built-in `node:sqlite`
+  module, so there are no npm runtime dependencies. On older Node versions the
+  Claude Code data still works and the tab shows a warning for OpenCode.
 
 ## Installation
 
-**From git** (recommended): Open **Settings > Plugins** in CloudCLI UI, paste this repository's URL, and click **Install**. The repo is cloned, dependencies are installed, TypeScript is compiled, and the plugin is ready to enable.
+**From git** (recommended): Open **Settings > Plugins** in CloudCLI UI, paste
+`https://github.com/PepperPhil/cloudcli-plugin-analytics`, and click
+**Install**. The host clones the repo, runs `npm install --ignore-scripts` and
+`npm run build`, and the plugin is ready to enable.
 
-**Manual:** Clone or copy this repository into your plugins directory:
-
+**Manual:**
 
 ```bash
-git clone https://github.com/cloudcli-ai/cloudcli-plugin-starter.git ~/.claude-code-ui/plugins/project-stats
-cd ~/.claude-code-ui/plugins/project-stats
+git clone https://github.com/PepperPhil/cloudcli-plugin-analytics.git ~/.claude-code-ui/plugins/cloudcli-plugin-analytics
+cd ~/.claude-code-ui/plugins/cloudcli-plugin-analytics
 npm install
 npm run build
 ```
 
-Then open **Settings > Plugins** — "Project Stats" should appear. Enable it to add the tab.
+Then open **Settings > Plugins**. "Analytics" should appear. Enable it to add
+the tab.
 
 ## Plugin structure
 
 ```
-project-stats/
-  manifest.json       # Required — plugin metadata
-  package.json        # Dependencies and build script
-  tsconfig.json       # TypeScript configuration
+cloudcli-plugin-analytics/
+  manifest.json         # Plugin metadata
+  package.json          # Build and test scripts (no runtime dependencies)
+  tsconfig.json         # TypeScript configuration (unchanged from the starter)
   src/
-    types.ts          # Plugin API type definitions
-    index.ts          # Frontend entry point (ES module)
-    server.ts         # Backend entry point (Node.js subprocess)
-  dist/               # Compiled output (auto-generated, not committed)
-    index.js          # Compiled frontend — referenced by manifest "entry"
-    server.js         # Compiled backend — referenced by manifest "server"
-  icon.svg            # Custom SVG icon for the tab
+    types.ts            # Plugin API type definitions (unchanged from the starter)
+    index.ts            # Frontend entry point: mount/unmount, rendering, polling
+    server.ts           # Backend entry point: HTTP server, /stats and /health
+    collector.ts        # Claude Code transcript parser and the shared aggregator
+    opencode.ts         # OpenCode SQLite reader
+    pricing.ts          # Anthropic price table and token helpers
+    collector.test.ts   # Unit tests (npm test)
+  dist/                 # Compiled output (auto-generated, not committed)
+  icon.svg              # Tab icon
 ```
 
-## How it works
+## Backend — server subprocess
 
-Plugins are TypeScript modules compiled to ES modules. The host calls your exported `mount(container, api)` function when the plugin tab is activated and `unmount(container)` when it is torn down.
+`dist/server.js` follows the starter contract. It listens on a random port on
+`127.0.0.1` and prints `{"ready": true, "port": N}` to stdout. The host
+proxies `api.rpc()` calls to it. It uses no secrets. Because the host passes
+only `PATH`, `HOME`, `NODE_ENV` and `PLUGIN_NAME`, all data paths are derived
+from `HOME`.
 
-Plugins that need server-side logic can declare a `"server"` entry in their manifest. The host spawns it as a child process and proxies requests to it via `api.rpc()`.
+- `GET /stats?range=1h|24h|7d|30d[&tool=all|claude|opencode][&project=/abs/path]`
+- `GET /health`
 
-```
-┌─────────────────────────────────────────────────────┐
-│  CloudCLI UI Host                                   │
-│                                                     │
-│  Plugin subprocess (dist/server.js):                │
-│    Runs as a child process with restricted env      │
-│    Listens on random local port                     │
-│    Receives secrets via X-Plugin-Secret-* headers   │
-└───────────┬─────────────────────────┬───────────────┘
-            │ serves static files     │ proxies RPC
-┌───────────▼─────────────────────────▼───────────────┐
-│  Frontend (browser)                                 │
-│                                                     │
-│  Plugin module (dist/index.js)                      │
-│    import(url) → mount(container, api)              │
-│    api.context          — theme / project / session │
-│    api.onContextChange  — subscribe to changes      │
-│    api.rpc(method, path, body) → Promise            │
-└─────────────────────────────────────────────────────┘
-```
+### Claude Code
 
-## TypeScript
+Reads `~/.claude/projects/**/*.jsonl` incrementally. It re-reads only the
+bytes appended since the last poll, and only files modified inside the
+selected range.
 
-This plugin is written in TypeScript. The `src/types.ts` file contains full type definitions for the plugin API (`PluginAPI`, `PluginContext`, `PluginModule`). Copy this file into your own plugin for type-safe development.
+| Metric | Source |
+|---|---|
+| tokens / cost | `assistant.message.usage` (deduped by `message.id`) |
+| latency | `assistant` timestamp − matching `api-request` (`requestRef`), else − parent entry timestamp |
+| turn duration | `system` / `turn_duration` |
+| reported cost | latest `cost-state.totalCostUSD` (resets when a session is resumed) |
+| session title | `ai-title`, else `last-prompt` |
 
-**Build:** `npm run build` compiles `src/` → `dist/` via `tsc`.
+Prices live in `src/pricing.ts` (Anthropic first-party rates, 2026-10). Cache
+writes are 1.25× input for the 5m TTL and 2× for the 1h TTL. Fast mode is
+priced at 2×. Models that aren't in the price table show "—".
 
-**Watch:** `npm run dev` recompiles on file changes.
+### OpenCode
 
-When installing via **Settings > Plugins**, the host automatically runs `npm install` and `npm run build` — no manual build step needed.
+Opens `~/.local/share/opencode/opencode.db` read-only. Only rows updated since
+the last poll are read. The last 30 days are kept in memory.
 
-## Frontend — Module API
+| Metric | Source |
+|---|---|
+| tokens / cost | assistant `message.data.tokens` / `.cost` (OpenCode's own estimate) |
+| model | `providerID/modelID`, e.g. `github-copilot/gpt-5.6-terra` (shown as `copilot/…`) |
+| latency | first non-`step-start` `part` − message creation |
+| turn duration / prompts | user message → last completed assistant reply to it |
+| reported cost | `session.cost` |
+| subagents | sessions with `parent_id` roll up into the root session |
 
-The host dynamically imports your compiled entry file and calls `mount(container, api)`. Render any UI inside the container — plain HTML, styled components, charts, dashboards, anything you can build with vanilla JavaScript and the DOM.
+GitHub Copilot bills by subscription and premium requests, so OpenCode's $
+figures for Copilot models are API-equivalent, not what you pay. "prompts"
+in the by-tool table counts user prompts, which is what premium requests are
+based on (before the model multiplier).
 
-```typescript
-import type { PluginAPI, PluginContext } from './types.js';
+Node prints an `ExperimentalWarning` for `node:sqlite` to stderr when the
+server starts. The host only logs it.
 
-export function mount(container: HTMLElement, api: PluginAPI): void {
-  const ctx: PluginContext = api.context;
-  container.innerHTML = `<p>Hello! Theme: ${ctx.theme}</p>`;
+## Development
 
-  const unsub = api.onContextChange((ctx) => {
-    container.style.background = ctx.theme === 'dark' ? '#111' : '#fff';
-  });
-
-  (container as any)._cleanup = unsub;
-}
-
-export function unmount(container: HTMLElement): void {
-  (container as any)._cleanup?.();
-  container.innerHTML = '';
-}
+```bash
+npm run dev    # recompile on change
+npm test       # build and run the unit tests
 ```
 
-### Context object
+## Security
 
-```typescript
-interface PluginContext {
-  theme: 'dark' | 'light';
-  project: { name: string; path: string } | null;
-  session: { id: string; title: string } | null;
-}
-```
-
-### RPC helper
-
-```typescript
-const data = await api.rpc('GET', '/stats?path=/my/project');
-const result = await api.rpc('POST', '/echo', { greeting: 'hi' });
-```
-
-## Backend — Server subprocess
-
-Plugins that need filesystem access, external APIs, npm packages, or persistent state can declare a `"server"` entry in their manifest. The host manages the lifecycle:
-
-1. When the plugin is enabled, the host spawns `node dist/server.js`
-2. The subprocess **must** print a JSON line to stdout: `{"ready": true, "port": 12345}`
-3. The host proxies requests from `api.rpc()` to that port
-4. When the plugin is disabled or uninstalled, the host sends SIGTERM
-
-### Secrets
-
-Per-plugin secrets are configured in **Settings > Plugins** and injected as HTTP headers on every proxied request (`x-plugin-secret-<name>`). They are never stored in the subprocess environment.
-
-### Restricted environment
-
-The subprocess runs with a minimal env — only `PATH`, `HOME`, `NODE_ENV`, and `PLUGIN_NAME`. It does not inherit the host's API keys or other secrets.
-
-## manifest.json
-
-```jsonc
-{
-  "name": "project-stats",        // Unique id — alphanumeric, hyphens, underscores
-  "displayName": "Project Stats",  // Shown in the UI
-  "version": "1.0.0",
-  "description": "Short description shown in settings.",
-  "author": "Your Name",
-  "icon": "icon.svg",             // Custom SVG icon
-  "type": "module",               // Must be "module"
-  "slot": "tab",                  // Where the plugin appears — only "tab" today
-  "entry": "dist/index.js",      // Compiled frontend entry file
-  "server": "dist/server.js",    // Optional — compiled backend entry file
-  "permissions": []                // Reserved for future use
-}
-```
-
-## Constraints
-
-Plugins cannot:
-
-- Modify built-in tabs or appear outside the tab area
-- Interact with Claude's chat system
-- Communicate with other plugins
-- Access authentication tokens or intercept requests
-
-## Security & Trust Model
-
-> **Plugins run at your own risk.** A plugin's frontend code executes in the
-> same JavaScript context as the host application — there is no runtime
-> sandbox. Only install plugins whose source code you have reviewed or that
-> come from authors you trust.
-
-CloudCLI follows a trust-through-transparency model: plugins are installed
-from git repositories with visible source, not from an anonymous marketplace.
-You are responsible for reviewing plugin code before installing.
-
-**Frontend** — Plugin modules run in the same JS context as the host and only receive the `api` object. All server communication goes through `api.rpc()`. However, because there is no runtime sandbox, a malicious plugin could in principle reach beyond the provided API.
-
-**Backend** — The subprocess runs as a separate OS process with restricted env, per-call secret injection via headers, and process-level isolation. Auth headers are stripped before proxying.
-
-**Install-time** — npm `postinstall` scripts are blocked (`--ignore-scripts`). Ship pre-built or use packages that work without postinstall hooks. The `npm run build` step is run automatically after install.
-
-## Contributing
-
-If you've built a plugin and would like it added to the official CloudCLI UI plugin repository, [open an issue](https://github.com/siteboon/claudecodeui/issues) with a link to your plugin's repository. The team will review it for inclusion.
+The plugin reads local files only (`~/.claude/projects` and the OpenCode
+database, read-only) and makes no network requests. As with every CloudCLI
+plugin, the frontend runs in the host's JS context with no sandbox. Review the
+source before installing.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
