@@ -276,6 +276,15 @@ interface ViewState {
   intervalMs: number;
 }
 
+/**
+ * The id the open session has in the tools' own data. CloudCLI's `session.id`
+ * is its app id, which differs from the Claude/OpenCode id on disk; older
+ * hosts don't send `providerSessionId`, so fall back to `id` there.
+ */
+function sessionKey(ctx: PluginContext): string | null {
+  return ctx.session ? ctx.session.providerSessionId || ctx.session.id : null;
+}
+
 /** CloudCLI passes an opaque project id as `name`, so label projects by their directory. */
 function projectLabel(p: string): string {
   return p.replace(/\/+$/, '').split('/').pop() || p || 'project';
@@ -338,7 +347,7 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
       else if (!oc.available && view.tool === 'opencode') body += card(c, 'opencode', empty(c, 'No OpenCode database found (~/.local/share/opencode/opencode.db).'));
     }
     if (stats) {
-      body += renderTiles(c, stats) + renderCharts(c, stats) + renderTools(c, stats) + renderSessions(c, stats, ctx.session?.id ?? null)
+      body += renderTiles(c, stats) + renderCharts(c, stats) + renderTools(c, stats) + renderSessions(c, stats, sessionKey(ctx))
         + `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:0 12px">${renderModels(c, stats)}${renderProjects(c, stats)}</div>`
         + renderRecent(c, stats)
         + `<div style="font-size:0.6rem;color:${c.muted};margin-top:4px">Claude Code costs are estimates from public per-token prices. OpenCode costs are OpenCode's own per-message figures; for GitHub Copilot these are API-equivalent, since Copilot bills by subscription and premium requests ("prompts"). "reported" is each tool's own session counter (Claude Code's resets on resume). Latency = request sent → first response block written. Data stays local (~/.claude/projects, ~/.local/share/opencode).</div>`;
@@ -358,7 +367,8 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     const ctx = api.context;
     const qs = new URLSearchParams({ range: view.range, tool: view.tool });
     if (view.scope === 'project' && ctx.project?.path) qs.set('project', ctx.project.path);
-    if (view.scope === 'session' && ctx.session) qs.set('session', ctx.session.id);
+    const session = sessionKey(ctx);
+    if (view.scope === 'session' && session) qs.set('session', session);
     try {
       const data = (await api.rpc('GET', `/stats?${qs}`)) as Stats & { error?: string };
       if (my !== seq || !alive) return;

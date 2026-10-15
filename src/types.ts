@@ -12,8 +12,12 @@ export interface PluginContext {
   theme: 'dark' | 'light';
   /** Currently selected project, or null if none. */
   project: { name: string; path: string } | null;
-  /** Currently active session, or null if none. */
-  session: { id: string; title: string } | null;
+  /**
+   * Currently active session, or null if none. `id` is CloudCLI's app id;
+   * `providerSessionId` is the tool's own id (Claude JSONL name, OpenCode
+   * `ses_…`), absent on older hosts and null until the provider announced it.
+   */
+  session: { id: string; title: string; provider?: string | null; providerSessionId?: string | null } | null;
 }
 
 /** The API object received in mount(container, api). */
