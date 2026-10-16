@@ -5,7 +5,7 @@
 </div>
 
 <p align="center">
-  <a href="https://cloudcli.ai/docs/plugin-overview">Plugin Docs</a> · Forked from <a href="https://github.com/cloudcli-ai/cloudcli-plugin-starter">cloudcli-plugin-starter</a>
+  <a href="https://cloudcli.ai/docs/plugin-overview">Plugin Docs</a> · Based on <a href="https://github.com/cloudcli-ai/cloudcli-plugin-starter">cloudcli-plugin-starter</a>
 </p>
 
 ---
@@ -140,8 +140,10 @@ npm test       # build and run the unit tests
 
 ## Security
 
-The plugin reads local files only (`~/.claude/projects` and the OpenCode
-database, read-only) and makes no network requests. As with every CloudCLI
+The plugin reads local files only and makes no network requests:
+`~/.claude/projects`, the OpenCode database and, to map CloudCLI's session ids
+to the tools' own, the `sessions` table of CloudCLI's database
+(`~/.cloudcli/auth.db`). Both databases are opened read-only. As with every CloudCLI
 plugin, the frontend runs in the host's JS context with no sandbox. Review the
 source before installing.
 
