@@ -5,6 +5,7 @@ import {
   zeroTokens,
   addTokens,
   estimateCost,
+  priceGeneration,
   cacheHitRate,
   totalTokens,
 } from './pricing.js';
@@ -23,8 +24,20 @@ export interface RequestRecord {
   model: string;
   tokens: Tokens;
   cost: number | null;
+  /** Set when `cost` is our own estimate rather than the tool's figure; it is redone when prices change. */
+  estimate?: { model: string; fast: boolean; generation: number };
   latencyMs: number | null;
   sidechain: boolean;
+}
+
+/** Recomputes an estimated cost made with an older price table. */
+export function repriced(r: RequestRecord): RequestRecord {
+  const e = r.estimate;
+  if (e && e.generation !== priceGeneration()) {
+    r.cost = estimateCost(e.model, r.tokens, e.fast);
+    e.generation = priceGeneration();
+  }
+  return r;
 }
 
 interface CostState {
@@ -193,6 +206,7 @@ export function applyLine(st: FileState, line: string): void {
     model: msg.model,
     tokens,
     cost: estimateCost(msg.model, tokens, msg.usage.speed === 'fast'),
+    estimate: { model: msg.model, fast: msg.usage.speed === 'fast', generation: priceGeneration() },
     latencyMs: latency > 0 && latency <= MAX_LATENCY_MS ? latency : null,
     sidechain: obj.isSidechain === true,
   });
@@ -434,6 +448,7 @@ export function aggregate(
       const key = `${r.tool}:${r.id}`;
       if (r.ts < windowStart || r.ts > nowMs + 60_000 || seen.has(key) || !inScope(r.cwd, r.sessionId)) continue;
       seen.add(key);
+      repriced(r);
       addToGroup(total, r);
       const bi = Math.min(nBuckets - 1, Math.max(0, Math.floor((r.ts - windowStart) / bucketMs)));
       addToGroup(buckets[bi], r);

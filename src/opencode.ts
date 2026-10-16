@@ -1,13 +1,12 @@
 import fs from 'node:fs';
-import { createRequire } from 'node:module';
 import { RequestRecord, SessionSource, MAX_LATENCY_MS } from './collector.js';
-import { Tokens, estimateCost } from './pricing.js';
+import { Tokens, estimateCost, priceGeneration } from './pricing.js';
+import { openReadOnly, ReadOnlyDb } from './sqlite.js';
 
 // OpenCode (sst/opencode) keeps sessions in ~/.local/share/opencode/opencode.db.
 // Each assistant `message` row is one model response; `data` holds providerID/modelID,
 // tokens and OpenCode's own cost estimate. Sessions spawned by the task tool have a parent_id.
 
-const require = createRequire(import.meta.url);
 /** Re-read rows updated this close to the watermark, in case they committed late. */
 const OVERLAP_MS = 5_000;
 const MAX_PARENT_DEPTH = 16;
@@ -115,6 +114,7 @@ export function parseMessage(row: MessageRow): OcMessage {
     model,
     tokens,
     cost: typeof row.cost === 'number' ? row.cost : estimateCost(row.model, tokens),
+    estimate: typeof row.cost === 'number' ? undefined : { model: row.model, fast: false, generation: priceGeneration() },
     latencyMs: latency > 0 && latency <= MAX_LATENCY_MS ? latency : null,
     sidechain: false,
   };
@@ -122,12 +122,12 @@ export function parseMessage(row: MessageRow): OcMessage {
 }
 
 export class OpenCodeStore {
-  private db: any = null;
+  private db: ReadOnlyDb | null = null;
   private sessions = new Map<string, OcSession>();
   private messages = new Map<string, OcMessage>();
   private sessionMark = 0;
   private messageMark = 0;
-  /** Last read failure (missing node:sqlite, schema change, …); null when healthy. */
+  /** Last read failure (no SQLite driver, schema change, …); null when healthy. */
   error: string | null = null;
 
   constructor(readonly dbPath: string, private retentionMs: number) {}
@@ -136,13 +136,11 @@ export class OpenCodeStore {
     return fs.existsSync(this.dbPath);
   }
 
-  private open(): any {
+  private open(): ReadOnlyDb | null {
     if (this.db) return this.db;
     if (!this.available()) return null;
-    // node:sqlite ships with Node ≥ 22.5; loaded lazily so older runtimes still serve Claude data.
-    const { DatabaseSync } = require('node:sqlite');
-    this.db = new DatabaseSync(this.dbPath, { readOnly: true });
-    this.db.exec('PRAGMA busy_timeout = 2000');
+    // Opened lazily, so a missing SQLite driver still leaves the Claude data working.
+    this.db = openReadOnly(this.dbPath);
     return this.db;
   }
 

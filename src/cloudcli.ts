@@ -1,24 +1,20 @@
 import fs from 'node:fs';
-import { createRequire } from 'node:module';
+import { openReadOnly, ReadOnlyDb } from './sqlite.js';
 
 // CloudCLI hands plugins its own app session id, which differs from the id the
 // tool uses on disk (Claude JSONL name, OpenCode `ses_…`). Its `sessions` table
 // maps one to the other; `superseded_provider_sessions` keeps the ids a Claude
 // session had before a resume moved it onto a new one.
 
-const require = createRequire(import.meta.url);
-
 export class CloudCliSessions {
-  private db: any = null;
+  private db: ReadOnlyDb | null = null;
 
   constructor(readonly dbPath: string) {}
 
-  private open(): any {
+  private open(): ReadOnlyDb | null {
     if (this.db) return this.db;
     if (!fs.existsSync(this.dbPath)) return null;
-    const { DatabaseSync } = require('node:sqlite');
-    this.db = new DatabaseSync(this.dbPath, { readOnly: true });
-    this.db.exec('PRAGMA busy_timeout = 2000');
+    this.db = openReadOnly(this.dbPath);
     return this.db;
   }
 

@@ -10,8 +10,11 @@ export interface Tokens {
 /** $ per million tokens: [input, output, cacheRead]. Cache writes derive from input. */
 type Price = [number, number, number];
 
+/** Date of the built-in price table, shown in the UI so stale prices are visible. */
+export const PRICES_AS_OF = '2026-10';
+
 // First match wins, so specific versions come before family fallbacks.
-// Anthropic first-party rates as of 2026-10.
+// Anthropic first-party rates as of PRICES_AS_OF.
 const PRICES: [RegExp, Price][] = [
   [/(fable|mythos)-5-1/, [10, 50, 0.25]],
   [/fable|mythos/, [10, 50, 1]],
@@ -25,6 +28,58 @@ const PRICES: [RegExp, Price][] = [
   [/haiku-3-5|3-5-haiku/, [0.8, 4, 0.08]],
   [/haiku/, [0.25, 1.25, 0.03]],
 ];
+
+/** User price entry: $ per million tokens. `cacheRead` defaults to 0.1× input. */
+export interface PriceOverride {
+  match: string;
+  input: number;
+  output: number;
+  cacheRead?: number;
+}
+
+let overrides: [string, Price][] = [];
+/** Bumped whenever prices change, so estimates made earlier can be recomputed. */
+let generation = 0;
+
+export function priceGeneration(): number {
+  return generation;
+}
+
+/**
+ * Validates the user's price file (`{ "<model substring>": { input, output, cacheRead? } }`)
+ * and returns the usable entries plus one message per rejected entry.
+ */
+export function parseOverrides(json: unknown): { entries: PriceOverride[]; errors: string[] } {
+  const entries: PriceOverride[] = [];
+  const errors: string[] = [];
+  if (!json || typeof json !== 'object' || Array.isArray(json)) {
+    return { entries, errors: ['expected an object keyed by model name'] };
+  }
+  const isRate = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+  for (const [match, value] of Object.entries(json as Record<string, unknown>)) {
+    const v = value as Record<string, unknown> | null;
+    if (!match || !v || !isRate(v.input) || !isRate(v.output) || (v.cacheRead !== undefined && !isRate(v.cacheRead))) {
+      errors.push(`"${match}": needs numeric input and output ($ per million tokens)`);
+      continue;
+    }
+    entries.push({ match: match.toLowerCase(), input: v.input, output: v.output, cacheRead: v.cacheRead as number | undefined });
+  }
+  return { entries, errors };
+}
+
+/** Replaces the user prices; they are checked before the built-in table, in file order. */
+export function setPriceOverrides(entries: PriceOverride[]): void {
+  overrides = entries.map((e) => [e.match, [e.input, e.output, e.cacheRead ?? e.input * 0.1]]);
+  generation += 1;
+}
+
+function findPrice(model: string): { price: Price; builtIn: boolean } | null {
+  const lower = model.toLowerCase();
+  const own = overrides.find(([match]) => lower.includes(match));
+  if (own) return { price: own[1], builtIn: false };
+  const price = PRICES.find(([re]) => re.test(model))?.[1];
+  return price ? { price, builtIn: true } : null;
+}
 
 const M = 1_000_000;
 const CACHE_WRITE_5M = 1.25;
@@ -60,10 +115,10 @@ export function cacheHitRate(t: Tokens): number | null {
 
 /** Estimated cost in dollars for one request, or null when the model is not in the price table. */
 export function estimateCost(model: string, t: Tokens, fast = false): number | null {
-  const price = PRICES.find(([re]) => re.test(model))?.[1];
-  if (!price) return null;
-  let [inp, out, cr] = price;
-  if (/haiku-5-5/.test(model) && promptTokens(t) > HAIKU_55_LONG_PROMPT) {
+  const found = findPrice(model);
+  if (!found) return null;
+  let [inp, out, cr] = found.price;
+  if (found.builtIn && /haiku-5-5/.test(model) && promptTokens(t) > HAIKU_55_LONG_PROMPT) {
     inp = 0.5;
     out = 2.5;
     cr = 0.05;

@@ -1,6 +1,7 @@
 /**
  * Analytics plugin — module entry point.
- * Real-time cost, cache hit rate, token usage and latency for Claude Code and OpenCode.
+ * Real-time cost, cache hit rate, token usage and latency for Claude Code and OpenCode,
+ * Claude plan limits, and PRISM session health.
  */
 
 import type { PluginAPI, PluginContext } from './types.js';
@@ -35,7 +36,25 @@ interface Stats {
   })[];
   recent: { ts: number; tool: Tool; model: string; project: string; cost: number | null; latencyMs: number | null; tokens: number; cacheHitRate: number | null; sidechain: boolean }[];
   tools: Record<Tool, { available: boolean; error: string | null }>;
+  prices?: PricesInfo;
 }
+interface PricesInfo { asOf: string; file: string; loaded: boolean; overrides: number; errors: string[] }
+
+interface LimitWindow { kind: string; label: string; percent: number; severity: string; resetsAt: string | null }
+type LimitsResult = { ok: true; plan: string | null; limits: LimitWindow[] } | { ok: false; error: string };
+
+interface PrismReport {
+  project: string;
+  display_name: string;
+  session_count: number;
+  overall_grade: string;
+  overall_score: number;
+  dimensions: Record<string, { grade: string; score: number }>;
+  top_issues: { severity: string; category: string; description: string }[];
+}
+type HealthResult =
+  | { ok: true; version: string | null; reports: PrismReport[]; generatedAt: number }
+  | { ok: false; notInstalled: boolean; error: string };
 
 type Range = '1h' | '24h' | '7d' | '30d';
 const RANGES: Range[] = ['1h', '24h', '7d', '30d'];
@@ -270,9 +289,165 @@ function renderRecent(c: ThemeColors, s: Stats): string {
     ]), 3));
 }
 
+// ── Plan limits ─────────────────────────────────────────────────────────
+
+function fmtUntil(iso: string | null): string {
+  const ms = iso ? Date.parse(iso) - Date.now() : NaN;
+  if (!Number.isFinite(ms)) return '';
+  if (ms <= 0) return 'resets now';
+  const m = Math.floor(ms / 60_000);
+  const h = Math.floor(m / 60);
+  const d = Math.floor(h / 24);
+  return `resets in ${d ? `${d}d ${h % 24}h` : h ? `${h}h ${m % 60}m` : `${m}m`}`;
+}
+
+function limitColor(c: ThemeColors, pct: number): string {
+  if (pct >= 90) return c.bad;
+  if (pct >= 70) return c.warn;
+  return c.ok;
+}
+
+function renderLimits(c: ThemeColors, l: LimitsResult | null): string {
+  if (!l) return '';
+  if (!l.ok) return card(c, 'claude plan limits', empty(c, l.error));
+  const title = `claude plan limits${l.plan ? ` · ${esc(l.plan)}` : ''}`;
+  if (!l.limits.length) return card(c, title, empty(c, 'The usage endpoint returned no limits.'));
+  const rows = l.limits.map((w) => {
+    const color = limitColor(c, w.percent);
+    const reset = w.resetsAt ? new Date(w.resetsAt).toLocaleString() : '';
+    return `
+      <div style="display:grid;grid-template-columns:minmax(90px,170px) minmax(60px,1fr) 42px;gap:10px;align-items:center;font-size:0.72rem;margin-top:8px">
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(w.label)}</span>
+        <div style="height:8px;background:${c.border};border-radius:2px;overflow:hidden">
+          <div style="width:${Math.min(100, w.percent)}%;height:100%;background:${color}"></div>
+        </div>
+        <span style="text-align:right;color:${color}">${Math.round(w.percent)}%</span>
+      </div>
+      <div title="${esc(reset)}" style="font-size:0.62rem;color:${c.muted};margin-top:2px">${esc(fmtUntil(w.resetsAt))}</div>`;
+  }).join('');
+  return card(c, title, `<div style="margin-top:-8px">${rows}</div>`);
+}
+
+// ── Prices ──────────────────────────────────────────────────────────────
+
+function renderPriceWarnings(c: ThemeColors, s: Stats): string {
+  const unpriced = s.byModel.filter((m) => m.unpricedRequests > 0);
+  const errors = s.prices?.errors ?? [];
+  if (!unpriced.length && !errors.length) return '';
+  const file = esc(s.prices?.file ?? '~/.config/cloudcli-analytics/prices.json');
+  const models = unpriced.map((m) => `${toolTag(c, m.tool)}${esc(m.model)} <span style="color:${c.muted}">(${m.unpricedRequests} req)</span>`).join('<br>');
+  // OpenCode estimates are priced by the bare model id, without the provider prefix.
+  const exampleKey = unpriced[0]?.model.split('/').pop() || 'model-name';
+  const example = esc(JSON.stringify({ [exampleKey]: { input: 3, output: 15, cacheRead: 0.3 } }));
+  return card(c, 'prices', `<div style="font-size:0.72rem;line-height:1.6">
+    ${unpriced.length ? `<div>No price for these models, so their cost is left out:</div><div style="margin:6px 0">${models}</div>
+      <div style="color:${c.muted}">Add them to <code>${file}</code> in $ per million tokens; cache writes derive from input, cacheRead defaults to 0.1× input:</div>
+      <code style="display:block;margin-top:4px;color:${c.muted};white-space:pre-wrap;word-break:break-all">${example}</code>` : ''}
+    ${errors.map((e) => `<div style="color:${c.warn}">⚠ ${file}: ${esc(e)}</div>`).join('')}
+  </div>`);
+}
+
+// ── Session health (PRISM) ──────────────────────────────────────────────
+
+const DIMENSIONS: Record<string, string> = {
+  token_efficiency: 'token efficiency',
+  tool_health: 'tool health',
+  context_hygiene: 'context hygiene',
+  claude_md_adherence: 'CLAUDE.md adherence',
+  session_continuity: 'session continuity',
+};
+
+function dimensionLabel(key: string): string {
+  return DIMENSIONS[key] ?? key.replace(/_/g, ' ');
+}
+
+function scoreColor(c: ThemeColors, score: number): string {
+  if (score >= 85) return c.ok;
+  if (score >= 70) return c.warn;
+  return c.bad;
+}
+
+function severityColor(c: ThemeColors, severity: string): string {
+  const s = severity.toLowerCase();
+  if (s === 'high' || s === 'critical') return c.bad;
+  if (s === 'medium') return c.warn;
+  return c.muted;
+}
+
+function renderReport(c: ThemeColors, r: PrismReport): string {
+  const color = scoreColor(c, r.overall_score);
+  const dims = Object.entries(r.dimensions).map(([key, d]) => `
+    <div style="display:grid;grid-template-columns:minmax(110px,170px) minmax(60px,1fr) 34px 26px;gap:10px;align-items:center;font-size:0.72rem;margin-top:8px">
+      <span>${esc(dimensionLabel(key))}</span>
+      <div style="height:8px;background:${c.border};border-radius:2px;overflow:hidden">
+        <div style="width:${Math.max(0, Math.min(100, d.score))}%;height:100%;background:${scoreColor(c, d.score)}"></div>
+      </div>
+      <span style="text-align:right">${Math.round(d.score)}</span>
+      <span style="color:${scoreColor(c, d.score)}">${esc(d.grade)}</span>
+    </div>`).join('');
+  const issues = r.top_issues.length
+    ? r.top_issues.map((i) => `
+      <div style="display:grid;grid-template-columns:60px minmax(90px,140px) 1fr;gap:10px;font-size:0.72rem;padding:5px 0;border-bottom:1px solid ${c.border}">
+        <span style="color:${severityColor(c, i.severity)};text-transform:uppercase;font-size:0.62rem">${esc(i.severity)}</span>
+        <span style="color:${c.muted}">${esc(dimensionLabel(i.category))}</span>
+        <span style="word-break:break-word">${esc(i.description)}</span>
+      </div>`).join('')
+    : empty(c, 'No issues found.');
+  return `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px">
+      ${tile(c, 'overall health', esc(r.overall_grade), `${r.overall_score.toFixed(1)} / 100 · ${r.session_count} sessions`, color)}
+    </div>
+    ${card(c, 'dimensions', dims)}
+    ${card(c, 'top issues', issues)}`;
+}
+
+/** Directory name, or the last two segments where names repeat (e.g. two `homeassistant` checkouts). */
+function uniqueLabels(paths: string[]): Map<string, string> {
+  const base = (p: string) => projectLabel(p);
+  const counts = new Map<string, number>();
+  for (const p of paths) counts.set(base(p), (counts.get(base(p)) ?? 0) + 1);
+  return new Map(paths.map((p) => [p, (counts.get(base(p)) ?? 0) > 1 ? p.replace(/\/+$/, '').split('/').slice(-2).join('/') : base(p)]));
+}
+
+function renderOverview(c: ThemeColors, reports: PrismReport[]): string {
+  const sorted = [...reports].sort((a, b) => a.overall_score - b.overall_score);
+  const labels = uniqueLabels(sorted.map((r) => r.display_name));
+  return card(c, 'all projects · worst first', table(c,
+    ['project', 'weakest', 'top issue', 'grade', 'score', 'sessions'],
+    sorted.map((r) => {
+      const weakest = Object.entries(r.dimensions).sort(([, a], [, b]) => a.score - b.score)[0];
+      const issue = r.top_issues[0];
+      return [
+        `<span title="${esc(r.display_name)}">${esc(labels.get(r.display_name) ?? r.display_name)}</span>`,
+        weakest ? `${esc(dimensionLabel(weakest[0]))} <span style="color:${scoreColor(c, weakest[1].score)}">${Math.round(weakest[1].score)}</span>` : '—',
+        issue ? `<span title="${esc(issue.description)}" style="color:${severityColor(c, issue.severity)}">${esc(issue.description.slice(0, 70))}${issue.description.length > 70 ? '…' : ''}</span>` : '—',
+        `<span style="color:${scoreColor(c, r.overall_score)}">${esc(r.overall_grade)}</span>`,
+        r.overall_score.toFixed(1), String(r.session_count),
+      ];
+    }), 3));
+}
+
+function renderHealth(c: ThemeColors, h: HealthResult | null, loading: boolean, single: boolean): string {
+  if (!h) return card(c, 'session health', empty(c, loading ? 'Running PRISM…' : ''));
+  if (!h.ok) {
+    if (!h.notInstalled) return card(c, 'session health', `<div style="font-size:0.75rem;color:${c.warn}">⚠ ${esc(h.error)}</div>`);
+    return card(c, 'session health', `<div style="font-size:0.75rem;line-height:1.6">
+      Session health is scored by <a href="https://github.com/jakeefr/prism" target="_blank" rel="noopener noreferrer" style="color:${c.accent}">PRISM</a>,
+      a local Python CLI (3.11+): token efficiency, tool health, context hygiene, CLAUDE.md adherence and session continuity.
+      <div style="margin-top:8px">Install it, then press refresh:</div>
+      <code style="display:block;margin-top:4px;color:${c.muted}">pipx install prism-cc</code>
+    </div>`);
+  }
+  if (!h.reports.length) return card(c, 'session health', empty(c, 'PRISM found no Claude Code sessions here.'));
+  return single && h.reports.length === 1 ? renderReport(c, h.reports[0]) : renderOverview(c, h.reports);
+}
+
 // ── Controls ────────────────────────────────────────────────────────────
 
 interface ViewState {
+  page: 'usage' | 'health';
+  /** Health covers the selected project, or every project when none is selected or 'all' is picked. */
+  healthScope: 'project' | 'all';
   range: Range;
   scope: 'all' | 'project' | 'session';
   tool: Tool | 'all';
@@ -300,21 +475,39 @@ function pill(c: ThemeColors, active: boolean, action: string, value: string, la
     color:${active ? c.bg : disabled ? c.border : c.text}">${label}</button>`;
 }
 
-function renderHeader(c: ThemeColors, v: ViewState, ctx: PluginContext, s: Stats | null, loading: boolean): string {
-  const live = v.intervalMs > 0;
-  const status = s ? `updated ${new Date(s.generatedAt).toLocaleTimeString()}` : loading ? 'loading…' : '';
-  return `
-    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:14px">
+function healthProject(v: ViewState, ctx: PluginContext): string | null {
+  return v.healthScope === 'project' && ctx.project ? ctx.project.path : null;
+}
+
+function renderHeader(c: ThemeColors, v: ViewState, ctx: PluginContext, status: string, live: boolean): string {
+  const pages = `<div style="display:flex;gap:4px">${pill(c, v.page === 'usage', 'page', 'usage', 'usage')}${pill(c, v.page === 'health', 'page', 'health', 'health', false, 'Session health scored by PRISM')}</div>`;
+  const title = `
       <div style="display:flex;align-items:center;gap:8px;margin-right:auto">
         <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${live ? c.ok : c.muted};${live ? `box-shadow:0 0 8px ${c.ok}` : ''}"></span>
         <span style="font-size:0.95rem;font-weight:600">Analytics</span>
         <span style="font-size:0.66rem;color:${c.muted}">${status}</span>
+      </div>`;
+  const projectPill = (active: boolean, action: string) => pill(c, active, action, 'project', ctx.project ? esc(projectLabel(ctx.project.path)) : 'project', !ctx.project,
+    ctx.project ? `Only this project directory: ${ctx.project.path}` : 'No project selected');
+  if (v.page === 'health') {
+    return `
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:14px">
+      ${title}${pages}
+      <div style="display:flex;gap:4px">
+        ${pill(c, !healthProject(v, ctx), 'health-scope', 'all', 'all projects')}
+        ${projectPill(!!healthProject(v, ctx), 'health-scope')}
       </div>
+      ${pill(c, false, 'prism-refresh', '', 'refresh', false, 'Re-run the PRISM analysis')}
+    </div>`;
+  }
+  return `
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:14px">
+      ${title}${pages}
       <div style="display:flex;gap:4px">${RANGES.map((r) => pill(c, v.range === r, 'range', r, r)).join('')}</div>
       <div style="display:flex;gap:4px">${TOOL_FILTERS.map(([t, l]) => pill(c, v.tool === t, 'tool', t, l)).join('')}</div>
       <div style="display:flex;gap:4px">
         ${pill(c, v.scope === 'all', 'scope', 'all', 'all projects')}
-        ${pill(c, v.scope === 'project', 'scope', 'project', ctx.project ? esc(projectLabel(ctx.project.path)) : 'project', !ctx.project, ctx.project ? `Only this project directory: ${ctx.project.path}` : 'No project selected')}
+        ${projectPill(v.scope === 'project', 'scope')}
         ${pill(c, v.scope === 'session', 'scope', 'session', 'this session', !ctx.session, ctx.session ? `Only the open session: ${ctx.session.title}` : 'No session open')}
       </div>
       <div style="display:flex;gap:4px;align-items:center">
@@ -327,8 +520,14 @@ function renderHeader(c: ThemeColors, v: ViewState, ctx: PluginContext, s: Stats
 // ── Mount / unmount ─────────────────────────────────────────────────────
 
 export function mount(container: HTMLElement, api: PluginAPI): void {
-  const view: ViewState = { range: '24h', scope: 'all', tool: 'all', intervalMs: 5_000 };
+  const view: ViewState = { page: 'usage', healthScope: 'project', range: '24h', scope: 'all', tool: 'all', intervalMs: 5_000 };
   let stats: Stats | null = null;
+  let limits: LimitsResult | null = null;
+  let health: HealthResult | null = null;
+  let healthLoading = false;
+  let healthSeq = 0;
+  /** Project the shown health report belongs to ('' = all projects). */
+  let healthFor: string | null = null;
   let error: string | null = null;
   let loading = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -342,6 +541,14 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     const ctx = api.context;
     const c = themeColors(ctx.theme === 'dark');
     root.style.cssText = `font-family:${MONO};background:${c.bg};color:${c.text};padding:18px;min-height:100%;box-sizing:border-box;overflow:auto;height:100%`;
+    if (view.page === 'health') {
+      const status = healthLoading ? 'analyzing…'
+        : health?.ok ? `PRISM ${health.version ? `v${esc(health.version)} ` : ''}· analyzed ${new Date(health.generatedAt).toLocaleTimeString()}` : '';
+      root.innerHTML = renderHeader(c, view, ctx, status, false)
+        + renderHealth(c, health, healthLoading, !!healthProject(view, ctx))
+        + `<div style="font-size:0.6rem;color:${c.muted};margin-top:4px">Scored locally by PRISM from ~/.claude/projects (Claude Code only). Results are cached for 5 minutes; refresh re-runs the analysis.</div>`;
+      return;
+    }
     let body = '';
     if (error) body += card(c, 'error', `<div style="font-size:0.75rem;color:${c.warn}">⚠ ${esc(error)}</div>`);
     const oc = stats?.tools?.opencode;
@@ -349,19 +556,25 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
       if (oc.error) body += card(c, 'opencode', `<div style="font-size:0.75rem;color:${c.warn}">⚠ Could not read the OpenCode database: ${esc(oc.error)}</div>`);
       else if (!oc.available && view.tool === 'opencode') body += card(c, 'opencode', empty(c, 'No OpenCode database found (~/.local/share/opencode/opencode.db).'));
     }
+    if (view.tool !== 'opencode') body += renderLimits(c, limits);
     if (stats) {
-      body += renderTiles(c, stats) + renderCharts(c, stats) + renderTools(c, stats) + renderSessions(c, stats, sessionKey(ctx))
+      const p = stats.prices;
+      const priceNote = p
+        ? ` Built-in prices as of ${esc(p.asOf)}${p.overrides ? `; ${p.overrides} own price${p.overrides === 1 ? '' : 's'} from ${esc(p.file)}` : ''}.`
+        : '';
+      body += renderTiles(c, stats) + renderPriceWarnings(c, stats) + renderCharts(c, stats) + renderTools(c, stats) + renderSessions(c, stats, sessionKey(ctx))
         + `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:0 12px">${renderModels(c, stats)}${renderProjects(c, stats)}</div>`
         + renderRecent(c, stats)
-        + `<div style="font-size:0.6rem;color:${c.muted};margin-top:4px">Claude Code costs are estimates from public per-token prices. OpenCode costs are OpenCode's own per-message figures; for GitHub Copilot these are API-equivalent, since Copilot bills by subscription and premium requests ("prompts"). "reported" is each tool's own session counter (Claude Code's resets on resume). Latency = request sent → first response block written. Data stays local (~/.claude/projects, ~/.local/share/opencode).</div>`;
+        + `<div style="font-size:0.6rem;color:${c.muted};margin-top:4px">Claude Code costs are estimates from public per-token prices.${priceNote} OpenCode costs are OpenCode's own per-message figures; for GitHub Copilot these are API-equivalent, since Copilot bills by subscription and premium requests ("prompts"). "reported" is each tool's own session counter (Claude Code's resets on resume). Latency = request sent → first response block written. Plan limits come from Anthropic's usage endpoint with your Claude login; everything else is read locally (~/.claude/projects, ~/.local/share/opencode).</div>`;
     }
-    root.innerHTML = renderHeader(c, view, ctx, stats, loading) + body;
+    const status = stats ? `updated ${new Date(stats.generatedAt).toLocaleTimeString()}` : loading ? 'loading…' : '';
+    root.innerHTML = renderHeader(c, view, ctx, status, view.intervalMs > 0) + body;
   }
 
   function schedule(): void {
     if (timer) clearTimeout(timer);
     timer = null;
-    if (alive && view.intervalMs > 0) timer = setTimeout(load, view.intervalMs);
+    if (alive && view.page === 'usage' && view.intervalMs > 0) timer = setTimeout(load, view.intervalMs);
   }
 
   async function load(): Promise<void> {
@@ -373,6 +586,9 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     const session = sessionKey(ctx);
     if (view.scope === 'session' && session) qs.set('session', session);
     if (session) qs.set('current', session);
+    // Cached for a minute by the server, so polling with the stats is cheap.
+    const limitsRequest = view.tool === 'opencode' ? null : (api.rpc('GET', '/limits') as Promise<LimitsResult>)
+      .catch((err: Error): LimitsResult => ({ ok: false, error: err.message || 'Plan limits unavailable' }));
     try {
       const data = (await api.rpc('GET', `/stats?${qs}`)) as Stats & { error?: string };
       if (my !== seq || !alive) return;
@@ -386,6 +602,36 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     loading = false;
     render();
     schedule();
+    // Limits need a network round trip; neither the stats nor the next poll wait for them.
+    if (limitsRequest) {
+      const result = await limitsRequest;
+      if (my !== seq || !alive) return;
+      limits = result;
+      render();
+    }
+  }
+
+  async function loadHealth(refresh = false): Promise<void> {
+    const my = ++healthSeq;
+    const project = healthProject(view, api.context);
+    // Never show another project's report while the new one loads.
+    if (healthFor !== (project ?? '')) health = null;
+    healthLoading = true;
+    render();
+    const qs = new URLSearchParams();
+    if (project) qs.set('project', project);
+    if (refresh) qs.set('refresh', '1');
+    let result: HealthResult;
+    try {
+      result = (await api.rpc('GET', `/prism?${qs}`)) as HealthResult;
+    } catch (err) {
+      result = { ok: false, notInstalled: false, error: (err as Error).message || 'Failed to load session health' };
+    }
+    if (my !== healthSeq || !alive) return;
+    health = result;
+    healthFor = project ?? '';
+    healthLoading = false;
+    if (view.page === 'health') render();
   }
 
   function onClick(e: Event): void {
@@ -393,6 +639,23 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     if (!btn || btn.disabled) return;
     const value = btn.dataset.value ?? '';
     switch (btn.dataset.action) {
+      case 'page':
+        view.page = value as ViewState['page'];
+        if (timer) clearTimeout(timer);
+        timer = null;
+        if (view.page === 'health') void loadHealth();
+        else {
+          render();
+          void load();
+        }
+        return;
+      case 'health-scope':
+        view.healthScope = value as ViewState['healthScope'];
+        void loadHealth();
+        return;
+      case 'prism-refresh':
+        void loadHealth(true);
+        return;
       case 'range':
         view.range = value as Range;
         stats = null;
@@ -419,7 +682,7 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     if (document.hidden) {
       if (timer) clearTimeout(timer);
       timer = null;
-    } else if (view.intervalMs > 0) {
+    } else if (view.page === 'usage' && view.intervalMs > 0) {
       void load();
     }
   }
@@ -429,6 +692,12 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
   const unsub = api.onContextChange(() => {
     if (view.scope === 'project' && !api.context.project) view.scope = 'all';
     if (view.scope === 'session' && !api.context.session) view.scope = 'all';
+    if (view.page === 'health') {
+      // Theme and session changes don't affect the report; only a new project does.
+      if (healthFor !== (healthProject(view, api.context) ?? '')) void loadHealth();
+      else render();
+      return;
+    }
     render();
     void load();
   });
