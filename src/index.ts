@@ -19,6 +19,8 @@ interface Summary {
 }
 interface Stats {
   range: Range;
+  /** Every id the open session is known by in the tools' data; null on older plugin servers. */
+  currentSessionIds?: string[] | null;
   generatedAt: number;
   bucketMs: number;
   totals: Summary & { sessions: number; activeSessions: number; avgTurnMs: number | null; turns: number; prompts: number };
@@ -233,12 +235,13 @@ function renderProjects(c: ThemeColors, s: Stats): string {
 
 function renderSessions(c: ThemeColors, s: Stats, currentSession: string | null): string {
   if (!s.sessions.length) return card(c, 'sessions', empty(c, 'No sessions in this range.'));
+  const current = new Set(s.currentSessionIds ?? (currentSession ? [currentSession] : []));
   const rows = s.sessions.slice(0, 20).map((x) => {
     const dot = x.active
       ? `<span title="active (written in the last 2 min)" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${c.ok};margin-right:6px;box-shadow:0 0 6px ${c.ok}"></span>`
       : `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${c.border};margin-right:6px"></span>`;
     const name = esc(x.title || x.sessionId.slice(0, 8));
-    const mark = x.sessionId === currentSession ? ` <span style="color:${c.accent}">◂ current</span>` : '';
+    const mark = current.has(x.sessionId) ? ` <span style="color:${c.accent}">◂ current</span>` : '';
     const sub = x.subagentRequests ? ` <span style="color:${c.muted}">(+${x.subagentRequests} sub)</span>` : '';
     const reportedTitle = x.tool === 'claude'
       ? "Claude Code's own cost counter for the latest process of this session (resets on resume)"
@@ -369,6 +372,7 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     if (view.scope === 'project' && ctx.project?.path) qs.set('project', ctx.project.path);
     const session = sessionKey(ctx);
     if (view.scope === 'session' && session) qs.set('session', session);
+    if (session) qs.set('current', session);
     try {
       const data = (await api.rpc('GET', `/stats?${qs}`)) as Stats & { error?: string };
       if (my !== seq || !alive) return;

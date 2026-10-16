@@ -48,6 +48,7 @@ const server = http.createServer((req, res) => {
     const rangeParam = url.searchParams.get('range') ?? '24h';
     const project = url.searchParams.get('project') || null;
     const session = url.searchParams.get('session') || null;
+    const current = url.searchParams.get('current') || null;
     const tool = (url.searchParams.get('tool') ?? 'all') as ToolFilter;
     if (!(rangeParam in RANGES)) {
       res.writeHead(400);
@@ -64,16 +65,19 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: 'project must be an absolute path' }));
       return;
     }
-    if (session !== null && !/^[\w-]{1,128}$/.test(session)) {
+    if ([session, current].some((id) => id !== null && !/^[\w-]{1,128}$/.test(id))) {
       res.writeHead(400);
-      res.end(JSON.stringify({ error: 'session must be a session id' }));
+      res.end(JSON.stringify({ error: 'session and current must be session ids' }));
       return;
     }
     try {
       // Resolved on every request: a new session only gets its provider id
       // once its first run starts.
       const sessionIds = session ? cloudcli.resolve(session) : null;
-      res.end(JSON.stringify(getStats(rangeParam as RangeKey, { project, session: sessionIds }, tool)));
+      // Lets the UI mark the open session in the list whatever the scope.
+      const currentSessionIds = current ? (current === session ? sessionIds : cloudcli.resolve(current)) : null;
+      const stats = getStats(rangeParam as RangeKey, { project, session: sessionIds }, tool);
+      res.end(JSON.stringify({ ...stats, currentSessionIds }));
     } catch (err) {
       res.writeHead(500);
       res.end(JSON.stringify({ error: (err as Error).message }));

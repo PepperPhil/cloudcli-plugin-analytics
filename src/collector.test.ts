@@ -69,6 +69,9 @@ test('applyLine dedupes split assistant messages and measures latency', () => {
   assert.equal(aggregate(src, '1h', now, { project: '/proj' }).totals.requests, 0);
   assert.equal(aggregate(src, '1h', now, { session: 's1' }).totals.requests, 2);
   assert.equal(aggregate(src, '1h', now, { session: 's2' }).totals.requests, 0);
+  // Every id one session is known by, e.g. a Claude session across resumes.
+  assert.equal(aggregate(src, '1h', now, { session: ['app-1', 's1'] }).totals.requests, 2);
+  assert.equal(aggregate(src, '1h', now, { session: ['app-1', 's2'] }).totals.requests, 0);
 });
 
 function ocRow(over: Partial<MessageRow>): MessageRow {
@@ -164,4 +167,49 @@ test('aggregate keeps Claude and OpenCode sessions apart', () => {
   ], '1h', Date.parse('2026-10-15T10:30:00.000Z'));
   assert.equal(stats.sessions.length, 2);
   assert.deepEqual(stats.byTool.map((t) => t.tool), ['claude', 'opencode']);
+});
+
+test('CloudCliSessions maps an app id to its provider ids, including superseded ones', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { createRequire } = await import('node:module');
+  const { CloudCliSessions } = await import('./cloudcli.js');
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'analytics-cc-'));
+  const file = path.join(dir, 'auth.db');
+  const db = new DatabaseSync(file);
+  db.exec(`
+    CREATE TABLE sessions (session_id TEXT NOT NULL, provider TEXT NOT NULL, provider_session_id TEXT);
+    CREATE TABLE superseded_provider_sessions (provider_session_id TEXT NOT NULL, provider TEXT NOT NULL, session_id TEXT NOT NULL);
+    INSERT INTO sessions VALUES ('app-1', 'claude', 'claude-new'), ('app-2', 'opencode', NULL);
+    INSERT INTO superseded_provider_sessions VALUES ('claude-old', 'claude', 'app-1');`);
+  db.close();
+
+  const sessions = new CloudCliSessions(file);
+  assert.deepEqual(sessions.resolve('app-1').sort(), ['app-1', 'claude-new', 'claude-old']);
+  assert.deepEqual(sessions.resolve('claude-new').sort(), ['claude-new', 'claude-old']);
+  assert.deepEqual(sessions.resolve('app-2'), ['app-2']);
+  assert.deepEqual(sessions.resolve('unknown'), ['unknown']);
+  assert.deepEqual(new CloudCliSessions(path.join(dir, 'missing.db')).resolve('app-1'), ['app-1']);
+});
+
+test('CloudCliSessions still resolves the current id without the superseded table', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { createRequire } = await import('node:module');
+  const { CloudCliSessions } = await import('./cloudcli.js');
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'analytics-cc-'));
+  const file = path.join(dir, 'auth.db');
+  const db = new DatabaseSync(file);
+  db.exec(`
+    CREATE TABLE sessions (session_id TEXT NOT NULL, provider TEXT NOT NULL, provider_session_id TEXT);
+    INSERT INTO sessions VALUES ('app-1', 'claude', 'claude-new');`);
+  db.close();
+
+  assert.deepEqual(new CloudCliSessions(file).resolve('app-1').sort(), ['app-1', 'claude-new']);
 });

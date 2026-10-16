@@ -37,10 +37,14 @@ export class CloudCliSessions {
         .get(id, id) as { session_id: string; provider_session_id: string | null } | undefined;
       if (!row) return [...ids];
       if (row.provider_session_id) ids.add(row.provider_session_id);
-      const superseded = db
-        .prepare('SELECT provider_session_id FROM superseded_provider_sessions WHERE session_id = ?')
-        .all(row.session_id) as { provider_session_id: string }[];
-      for (const s of superseded) ids.add(s.provider_session_id);
+      try {
+        const superseded = db
+          .prepare('SELECT provider_session_id FROM superseded_provider_sessions WHERE session_id = ?')
+          .all(row.session_id) as { provider_session_id: string }[];
+        for (const s of superseded) ids.add(s.provider_session_id);
+      } catch {
+        // Older CloudCLI versions have no such table; the current id still applies.
+      }
     } catch {
       // Schema drift or a locked file: drop the handle so the next call retries.
       try {
