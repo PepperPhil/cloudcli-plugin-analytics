@@ -6,6 +6,8 @@ import {
   addTokens,
   estimateCost,
   priceGeneration,
+  priceBasis,
+  PriceBasis,
   cacheHitRate,
   totalTokens,
 } from './pricing.js';
@@ -137,10 +139,55 @@ function isTypedPrompt(content: unknown): boolean {
   return Array.isArray(content) && content.some((b) => b?.type === 'text' || b?.type === 'image');
 }
 
+// Fast paths for the bulky entries that only contribute a timestamp. Escaped
+// quotes inside JSON strings mean these unescaped key sequences can only be real
+// keys; when one is missing the line goes through JSON.parse as usual.
+const API_REQUEST_HEAD = /^\{"type":"api-request","sessionId":"([^"]*)","id":"([^"]*)","timestamp":"([^"]*)"/;
+const UUID_TS = /^,"uuid":"([^"]+)","timestamp":"([^"]+)"(,"toolUseResult":)?/;
+const FAST_MIN_LENGTH = 2048;
+
+/** A regex match is a slice that keeps the whole (often huge) line alive; store a copy instead. */
+function own(s: string): string {
+  return Buffer.from(s, 'utf8').toString('utf8');
+}
+
+function fastLine(st: FileState, line: string): boolean {
+  if (line.startsWith('{"type":"api-request"')) {
+    const m = API_REQUEST_HEAD.exec(line.slice(0, 256));
+    if (!m) return false;
+    const ts = Date.parse(m[3]);
+    if (!Number.isFinite(ts)) return false;
+    st.sessionId ??= own(m[1]);
+    if (ts > st.lastTs) st.lastTs = ts;
+    st.apiRequestTs.set(own(m[2]), ts);
+    return true;
+  }
+  // Session id and start directory come from the first entries, so only skip once they are known.
+  if (!st.sessionId || !st.cwd) return false;
+  // Decide from the start of the line, so assistant entries are never scanned twice.
+  const early = line.slice(0, 200);
+  const attachment = early.includes('"attachment":{');
+  if (!attachment && !early.includes('"type":"user","message"')) return false;
+  const at = line.indexOf(attachment ? '},"type":"attachment","uuid":"' : '},"uuid":"');
+  // A tool result that also carries typed text (e.g. feedback on a rejected tool) is a prompt.
+  if (at === -1 || (!attachment && line.includes('"type":"text"'))) return false;
+  // Skip to the `,"uuid"` key: past `},"type":"attachment"` (21 chars) or `}` (1).
+  const keyAt = at + (attachment ? 21 : 1);
+  const m = UUID_TS.exec(line.slice(keyAt, keyAt + 200));
+  // A user entry qualifies only with a tool result, which is never a typed prompt.
+  if (!m || (!attachment && !m[3])) return false;
+  const ts = Date.parse(m[2]);
+  if (!Number.isFinite(ts)) return false;
+  if (ts > st.lastTs) st.lastTs = ts;
+  st.uuidTs.set(own(m[1]), ts);
+  return true;
+}
+
 /** Apply one transcript line to the file state. Exported for tests. */
 export function applyLine(st: FileState, line: string): void {
   const head = line.slice(0, 48);
   if (SKIP_TYPES.some((t) => head.includes(t))) return;
+  if (line.length >= FAST_MIN_LENGTH && fastLine(st, line)) return;
   let obj: any;
   try {
     obj = JSON.parse(line);
@@ -214,6 +261,14 @@ export function applyLine(st: FileState, line: string): void {
 
 // ── Transcript store ───────────────────────────────────────────────────
 
+let sharedBuffer: Buffer | null = null;
+
+/** One read buffer for all files: allocating (and zeroing) 4 MB per file dominated cold starts. */
+function readBuffer(): Buffer {
+  sharedBuffer ??= Buffer.allocUnsafe(4 * 1024 * 1024);
+  return sharedBuffer;
+}
+
 export class TranscriptStore {
   private files = new Map<string, FileState>();
 
@@ -260,8 +315,8 @@ export class TranscriptStore {
     let fd: number | null = null;
     try {
       fd = fs.openSync(file, 'r');
-      const CHUNK = 4 * 1024 * 1024;
-      const buf = Buffer.alloc(CHUNK);
+      const buf = readBuffer();
+      const CHUNK = buf.length;
       while (st.offset < size) {
         const n = fs.readSync(fd, buf, 0, Math.min(CHUNK, size - st.offset), st.offset);
         if (n <= 0) break;
@@ -367,7 +422,8 @@ export interface AnalyticsStats {
   lastHour: { cost: number; requests: number };
   series: { t: number; cost: number; tokens: number; cacheHitRate: number | null; latencyP50: number | null; requests: number }[];
   byTool: (Summary & { tool: Tool; sessions: number; prompts: number })[];
-  byModel: (Summary & { model: string; tool: Tool })[];
+  /** `priceBasis` says where estimated costs come from; 'family' is a guess from the model family. */
+  byModel: (Summary & { model: string; tool: Tool; priceBasis: PriceBasis | null })[];
   byProject: (Summary & { project: string; cwd: string })[];
   sessions: (Summary & {
     tool: Tool;
@@ -542,7 +598,7 @@ export function aggregate(
       const g = tools.get(tool)!;
       return { tool, ...summarize(g), sessions: g.sessions.size, prompts: g.prompts };
     }),
-    byModel: [...models.values()].map((g) => ({ model: g.model, tool: g.tool, ...summarize(g) })).sort(rankByCost),
+    byModel: [...models.values()].map((g) => ({ model: g.model, tool: g.tool, priceBasis: priceBasis(g.model), ...summarize(g) })).sort(rankByCost),
     byProject: [...projects.entries()]
       .map(([cwd, g]) => ({ project: path.basename(cwd) || cwd || '(unknown)', cwd, ...summarize(g) }))
       .sort(rankByCost),

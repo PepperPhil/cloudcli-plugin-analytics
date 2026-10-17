@@ -5,9 +5,11 @@ import path from 'node:path';
 import { TranscriptStore, aggregate, RANGES, RangeKey, AnalyticsStats, Scope, Tool, TOOLS } from './collector.js';
 import { OpenCodeStore } from './opencode.js';
 import { CloudCliSessions } from './cloudcli.js';
-import { LimitsClient } from './limits.js';
+import { LimitsClient, readPlan } from './limits.js';
 import { PrismClient } from './prism.js';
-import { PRICES_AS_OF, parseOverrides, setPriceOverrides } from './pricing.js';
+import { PRICES_AS_OF, parseOverrides, setPriceOverrides, setRemotePrices } from './pricing.js';
+import { RemotePrices } from './remote-prices.js';
+import { DEFAULT_SETTINGS, Settings, SubscriptionTool, compare, parseSettings } from './subscriptions.js';
 
 // The host passes only PATH, HOME, NODE_ENV and PLUGIN_NAME, so paths derive from HOME.
 const HOME = process.env.HOME || os.homedir();
@@ -15,7 +17,10 @@ const CLAUDE_ROOT = path.join(HOME, '.claude', 'projects');
 const OPENCODE_DB = path.join(HOME, '.local', 'share', 'opencode', 'opencode.db');
 const CLOUDCLI_DB = path.join(HOME, '.cloudcli', 'auth.db');
 const CREDENTIALS = path.join(HOME, '.claude', '.credentials.json');
-const PRICES_FILE = path.join(HOME, '.config', 'cloudcli-analytics', 'prices.json');
+const CONFIG_DIR = path.join(HOME, '.config', 'cloudcli-analytics');
+const PRICES_FILE = path.join(CONFIG_DIR, 'prices.json');
+const SETTINGS_FILE = path.join(CONFIG_DIR, 'settings.json');
+const PRICE_CACHE = path.join(HOME, '.cache', 'cloudcli-analytics', 'litellm-prices.json');
 const CACHE_MS = 2_000;
 
 type ToolFilter = Tool | 'all';
@@ -27,11 +32,50 @@ const cloudcli = new CloudCliSessions(CLOUDCLI_DB);
 const limits = new LimitsClient(CREDENTIALS);
 const prism = new PrismClient(HOME);
 const cache = new Map<string, { at: number; data: Response }>();
+const remotePrices = new RemotePrices(PRICE_CACHE, (list) => {
+  setRemotePrices(list);
+  cache.clear();
+});
+
+// ── Subscription settings ───────────────────────────────────────────────
+
+function loadSettings(): { settings: Settings; error: string | null } {
+  try {
+    return parseSettings(JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')));
+  } catch (err) {
+    const missing = (err as NodeJS.ErrnoException).code === 'ENOENT';
+    return { settings: { ...DEFAULT_SETTINGS }, error: missing ? null : `${SETTINGS_FILE}: ${(err as Error).message}` };
+  }
+}
+
+function saveSettings(settings: Settings): void {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  const tmp = `${SETTINGS_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(settings, null, 2) + '\n');
+  fs.renameSync(tmp, SETTINGS_FILE);
+}
+
+/** API-equivalent cost per subscription: Claude Code requests, and OpenCode's GitHub Copilot models. */
+function subscriptionCosts(s: AnalyticsStats): Record<SubscriptionTool, number> {
+  return {
+    claude: s.byTool.find((t) => t.tool === 'claude')?.cost ?? 0,
+    copilot: s.byModel.filter((m) => m.tool === 'opencode' && m.model.startsWith('github-copilot/')).reduce((a, m) => a + m.cost, 0),
+  };
+}
+
+function subscriptions(range: RangeKey) {
+  const { settings } = loadSettings();
+  const plan = readPlan(CREDENTIALS);
+  // Subscriptions cover every project, so compare against unscoped usage.
+  const inRange = subscriptionCosts(getStats(range, {}, 'all'));
+  const month = range === '30d' ? inRange : subscriptionCosts(getStats('30d', {}, 'all'));
+  return compare(settings, plan, RANGES[range].spanMs, inRange, month);
+}
 
 // ── User prices ─────────────────────────────────────────────────────────
 // Re-read when the file changes, so a new model can be priced without a restart.
 
-type PricesInfo = { asOf: string; file: string; loaded: boolean; overrides: number; errors: string[] };
+type PricesInfo = { asOf: string; file: string; loaded: boolean; overrides: number; errors: string[]; remote?: RemotePrices['status'] };
 let prices: PricesInfo = { asOf: PRICES_AS_OF, file: PRICES_FILE, loaded: false, overrides: 0, errors: [] };
 let pricesMtime: number | null = null;
 
@@ -76,6 +120,32 @@ function getStats(range: RangeKey, scope: Scope, tool: ToolFilter): Response {
   return data;
 }
 
+const MAX_BODY = 64 * 1024;
+
+function readBody(req: http.IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_BODY) {
+        reject(new Error('request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null'));
+      } catch {
+        reject(new Error('request body is not JSON'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
 const server = http.createServer((req, res) => {
   res.setHeader('Content-Type', 'application/json');
   const url = new URL(req.url ?? '/', 'http://localhost');
@@ -114,7 +184,7 @@ const server = http.createServer((req, res) => {
       const currentSessionIds = current ? (current === session ? sessionIds : cloudcli.resolve(current)) : null;
       refreshPrices();
       const stats = getStats(rangeParam as RangeKey, { project, session: sessionIds }, tool);
-      res.end(JSON.stringify({ ...stats, currentSessionIds, prices }));
+      res.end(JSON.stringify({ ...stats, currentSessionIds, prices: { ...prices, remote: remotePrices.status }, subscriptions: subscriptions(rangeParam as RangeKey) }));
     } catch (err) {
       res.writeHead(500);
       res.end(JSON.stringify({ error: (err as Error).message }));
@@ -139,6 +209,35 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'POST' && url.pathname === '/prices/refresh') {
+    remotePrices.refresh().then(() => res.end(JSON.stringify({ ok: !remotePrices.status.error, status: remotePrices.status })));
+    return;
+  }
+
+  if (url.pathname === '/settings') {
+    if (req.method === 'GET') {
+      const { settings, error } = loadSettings();
+      res.end(JSON.stringify({ ok: true, settings, error, plan: readPlan(CREDENTIALS) }));
+      return;
+    }
+    if (req.method === 'PUT') {
+      readBody(req).then((body) => {
+        const { settings, error } = parseSettings(body);
+        if (error) {
+          res.end(JSON.stringify({ ok: false, error }));
+          return;
+        }
+        try {
+          saveSettings(settings);
+          res.end(JSON.stringify({ ok: true, settings }));
+        } catch (err) {
+          res.end(JSON.stringify({ ok: false, error: `Could not save settings: ${(err as Error).message}` }));
+        }
+      }, (err: Error) => res.end(JSON.stringify({ ok: false, error: err.message })));
+      return;
+    }
+  }
+
   if (req.method === 'GET' && url.pathname === '/health') {
     res.end(JSON.stringify({ ok: true, claudeRoot: CLAUDE_ROOT, opencodeDb: OPENCODE_DB, opencodeError: opencode.error }));
     return;
@@ -153,6 +252,8 @@ server.listen(0, '127.0.0.1', () => {
   if (addr && typeof addr !== 'string') {
     console.log(JSON.stringify({ ready: true, port: addr.port }));
   }
+  // Cached prices first, so the warm-up below already uses them; a download follows in the background.
+  remotePrices.start();
   // Warm the parse cache after signalling readiness (host waits max 10s for the ready line).
   setTimeout(() => {
     try {

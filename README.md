@@ -29,6 +29,9 @@ session health.
 - **Plan limits:** the 5-hour session window and weekly limits of your Claude
   plan, with time to reset (needs Claude Code signed in with a claude.ai
   account).
+- **Subscriptions:** what your requests would have cost at API prices against
+  the matching share of your Claude (detected from your login) and GitHub
+  Copilot fees, per range and for the last 30 days.
 
 Ranges are 1h, 24h, 7d and 30d. Tool filter is all, Claude Code or OpenCode.
 Scope is all projects, the selected project or the open session. A session
@@ -58,12 +61,18 @@ worst first.
 
 ## Prices
 
-Claude Code costs are estimates from a built-in Anthropic price table (dated in
-the tab's footer). Models it doesn't know show "—" and are listed in a
-**prices** card. Add or correct prices in
-`~/.config/cloudcli-analytics/prices.json`, in $ per million tokens. Keys match
-any model name that contains them (case-insensitive) and win over the built-in
-table:
+Costs are estimates from [LiteLLM's price list](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json),
+which uses the same model ids as Claude Code and includes cache-write and
+long-prompt rates. The plugin downloads it in the background at start and then
+daily, and keeps a copy in `~/.cache/cloudcli-analytics/litellm-prices.json`.
+Offline, it uses that copy or a built-in table. The footer says which source
+is in use; "update prices" fetches the list now.
+
+Models without an exact price are priced like their model family and shown
+with "≈"; models without any price show "—". Both are listed in a **prices**
+card. Add or correct prices in `~/.config/cloudcli-analytics/prices.json`, in
+$ per million tokens. Keys match any model name that contains them
+(case-insensitive) and win over every other source:
 
 ```json
 {
@@ -75,6 +84,21 @@ table:
 Cache writes are derived from `input` (1.25× for 5m, 2× for 1h);
 `cacheRead` defaults to 0.1× `input`. The file is re-read when it changes, and
 past requests are re-priced.
+
+## Subscriptions
+
+The Claude plan comes from your Claude Code login (Pro $20, Max 5x $100,
+Max 20x $200 list prices per month). **edit** in the subscriptions card sets
+your own price (for example in EUR or an annual plan), turns the Claude
+comparison off, or adds GitHub Copilot, which can't be detected. EUR prices are
+converted with a rate you set. Settings live in
+`~/.config/cloudcli-analytics/settings.json`.
+
+"value" is the API-equivalent cost of the requests in the range divided by the
+fee's share for that range (fee × range ÷ 30 days); above 1× the subscription
+pays off. Claude compares against Claude Code's costs, Copilot against
+OpenCode's `github-copilot/*` models. Subscriptions cover every project, so
+the comparison ignores the project and session filter.
 
 ## Installation
 
@@ -113,7 +137,9 @@ cloudcli-plugin-analytics/
     server.ts           # Backend entry point: HTTP server, /stats and /health
     collector.ts        # Claude Code transcript parser and the shared aggregator
     opencode.ts         # OpenCode SQLite reader
-    pricing.ts          # Anthropic price table, user prices and token helpers
+    pricing.ts          # Price lookup (own, LiteLLM, built-in) and token helpers
+    remote-prices.ts    # LiteLLM price list download and cache
+    subscriptions.ts    # Plan detection and fee comparison
     limits.ts           # Claude plan limits
     prism.ts            # PRISM runner
     cloudcli.ts         # CloudCLI app session id → tool session ids
@@ -134,6 +160,8 @@ from `HOME`.
 - `GET /stats?range=1h|24h|7d|30d[&tool=all|claude|opencode][&project=/abs/path][&session=id][&current=id]`
 - `GET /limits`: plan limits, cached for a minute
 - `GET /prism[?project=/abs/path][&refresh=1]`: PRISM report, cached for 5 minutes
+- `POST /prices/refresh`: download the price list now
+- `GET /settings`, `PUT /settings`: subscription settings
 - `GET /health`
 
 ### Claude Code
@@ -208,9 +236,11 @@ the `sessions` table of CloudCLI's database (`~/.cloudcli/auth.db`, to map
 CloudCLI's session ids to the tools' own) and your price file. Databases are
 opened read-only.
 
-Its only network request is the plan-limits call: it sends your Claude OAuth
-access token from `~/.claude/.credentials.json` to `api.anthropic.com`, the
-same thing Claude Code does. Usage data never leaves the machine. Health runs
+It makes two kinds of network request: the plan-limits call sends your Claude
+OAuth access token from `~/.claude/.credentials.json` to `api.anthropic.com`,
+the same thing Claude Code does, and the price list is downloaded from
+`raw.githubusercontent.com` without any data of yours. Usage data never leaves
+the machine. Health runs
 the locally installed `prism` CLI, which reads `~/.claude/projects` and makes
 no network calls. As with every CloudCLI
 plugin, the frontend runs in the host's JS context with no sandbox. Review the

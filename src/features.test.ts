@@ -57,7 +57,7 @@ test('parseCredentials reads the access token and expiry, nothing else', () => {
   const now = 1_000;
   assert.equal(parseCredentials({}, now), null);
   assert.deepEqual(parseCredentials({ claudeAiOauth: { accessToken: 't', refreshToken: 'r', expiresAt: 500, subscriptionType: 'pro' } }, now),
-    { accessToken: 't', expired: true, plan: 'pro' });
+    { accessToken: 't', expired: true, plan: 'pro', tier: null });
 });
 
 test('normalizeUsage maps known windows and skips malformed ones', () => {
@@ -170,4 +170,135 @@ test('PrismClient caches per project, refreshes on demand, and reports a missing
     return JSON.stringify([REPORT]);
   }).get('/p');
   assert.ok(noVersion.ok && noVersion.version === null && noVersion.reports.length === 1);
+});
+
+test('long transcript lines take the fast path with the same result as a full parse', async () => {
+  const { applyLine, newFileState } = await import('./collector.js');
+  const pad = 'x'.repeat(3000);
+  const ts = (s: number) => new Date(Date.UTC(2026, 9, 16, 10, 0, s)).toISOString();
+  const head = { sessionId: 's1', cwd: '/p' };
+  const lines = [
+    JSON.stringify({ type: 'user', ...head, uuid: 'u0', timestamp: ts(0), message: { role: 'user', content: 'hi' } }),
+    JSON.stringify({ type: 'api-request', sessionId: 's1', id: 'r1', timestamp: ts(1), params: pad }),
+    JSON.stringify({ parentUuid: 'u0', isSidechain: false, attachment: { type: 'hook', body: pad }, type: 'attachment', uuid: 'a1', timestamp: ts(2), ...head }),
+    JSON.stringify({ parentUuid: 'a1', isSidechain: false, promptId: 'p', type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: pad }] }, uuid: 't1', timestamp: ts(3), toolUseResult: { stdout: pad }, ...head }),
+    // A long typed prompt has no tool result, so it must still be counted.
+    JSON.stringify({ parentUuid: 't1', isSidechain: false, promptId: 'p', type: 'user', message: { role: 'user', content: pad }, uuid: 'u2', timestamp: ts(4), ...head }),
+    // An assistant entry whose tool input happens to contain the key must not be skipped.
+    JSON.stringify({ parentUuid: 'u2', isSidechain: false, type: 'assistant', requestRef: 'r1', message: { id: 'm1', model: 'claude-opus-5-5', usage: { input_tokens: 1, output_tokens: 1 }, content: [{ type: 'tool_use', input: { toolUseResult: pad } }] }, uuid: 'm', timestamp: ts(5), ...head }),
+  ];
+  const st = newFileState();
+  for (const l of lines) applyLine(st, l);
+  assert.equal(st.apiRequestTs.get('r1'), Date.parse(ts(1)));
+  assert.equal(st.uuidTs.get('a1'), Date.parse(ts(2)));
+  assert.equal(st.uuidTs.get('t1'), Date.parse(ts(3)));
+  assert.deepEqual(st.prompts, [Date.parse(ts(0)), Date.parse(ts(4))]);
+  assert.equal(st.requests.length, 1);
+  assert.equal(st.requests[0].latencyMs, 4000, 'latency measured from the fast-path api-request');
+  assert.equal(st.lastTs, Date.parse(ts(5)));
+});
+
+test('LiteLLM list: exact ids, tiers, junk skipped, and it wins over the built-in table', async () => {
+  const { parseLiteLlm } = await import('./remote-prices.js');
+  const { setRemotePrices, priceBasis } = await import('./pricing.js');
+  const list = parseLiteLlm({
+    'claude-sonnet-5-5': { litellm_provider: 'anthropic', input_cost_per_token: 2e-6, output_cost_per_token: 1e-5, cache_read_input_token_cost: 1e-7 },
+    'claude-haiku-5-5': {
+      litellm_provider: 'anthropic', input_cost_per_token: 1e-7, output_cost_per_token: 5e-7,
+      input_cost_per_token_above_100k_tokens: 5e-7, output_cost_per_token_above_100k_tokens: 2.5e-6,
+    },
+    'bedrock/claude-x': { litellm_provider: 'bedrock', input_cost_per_token: 1, output_cost_per_token: 1 },
+    broken: { litellm_provider: 'anthropic', input_cost_per_token: 'free' },
+    sample_spec: 'not an object',
+  });
+  assert.deepEqual([...list.keys()].sort(), ['claude-haiku-5-5', 'claude-sonnet-5-5']);
+  const sonnet = list.get('claude-sonnet-5-5')!;
+  assert.ok(Math.abs(sonnet.cacheRead - 0.1) < 1e-9 && Math.abs(sonnet.cacheWrite5m - 2.5) < 1e-9 && Math.abs(sonnet.cacheWrite1h - 4) < 1e-9);
+  assert.equal(list.get('claude-haiku-5-5')!.tiers?.[0].above, 100_000);
+
+  const t = { ...zeroTokens(), cacheRead: M };
+  assert.equal(priceBasis('claude-opus-5'), 'builtin');
+  assert.equal(priceBasis('claude-opus-7'), 'family');
+  assert.equal(priceBasis('acme-1'), null);
+  setRemotePrices(new Map([['claude-sonnet-5-5', { ...sonnet, cacheRead: 0.05 }]]));
+  try {
+    assert.equal(priceBasis('claude-sonnet-5-5-20261001'), 'litellm', 'date suffix stripped');
+    assert.equal(estimateCost('claude-sonnet-5-5', t), 0.05);
+    setPriceOverrides(parseOverrides({ 'sonnet-5-5': { input: 2, output: 10, cacheRead: 0.07 } }).entries);
+    assert.equal(priceBasis('claude-sonnet-5-5'), 'own');
+    assert.equal(estimateCost('claude-sonnet-5-5', t), 0.07);
+  } finally {
+    setPriceOverrides([]);
+    setRemotePrices(new Map());
+  }
+  assert.equal(estimateCost('claude-sonnet-5-5', t), 0.1, 'built-in table corrected to 0.1');
+  const long = { ...zeroTokens(), input: 200_000 };
+  assert.ok(Math.abs(estimateCost('claude-haiku-5-5', long)! - 0.1) < 1e-9, 'long-prompt tier applies above 100k');
+});
+
+test('RemotePrices loads the disk cache, downloads, writes the cache, and keeps the list on failure', async () => {
+  const { RemotePrices } = await import('./remote-prices.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'analytics-remote-'));
+  const cacheFile = path.join(dir, 'sub', 'prices.json');
+  const data = { 'claude-x-1': { litellm_provider: 'anthropic', input_cost_per_token: 1e-6, output_cost_per_token: 2e-6 } };
+  const got: number[] = [];
+  const ok = (async () => new Response(JSON.stringify(data))) as unknown as typeof fetch;
+  const a = new RemotePrices(cacheFile, (p) => got.push(p.size), ok, 'https://example.invalid/x.json');
+  await a.refresh();
+  assert.equal(a.status.models, 1);
+  assert.ok(fs.existsSync(cacheFile));
+
+  const failing = (async () => new Response('', { status: 503 })) as unknown as typeof fetch;
+  const b = new RemotePrices(cacheFile, (p) => got.push(p.size), failing, 'https://example.invalid/x.json');
+  b.start();
+  b.stop();
+  assert.equal(b.status.models, 1, 'served from the disk cache');
+  await b.refresh();
+  assert.equal(b.status.models, 1, 'a failed refresh keeps the cached list');
+  assert.match(b.status.error ?? '', /503/);
+  assert.deepEqual(got, [1, 1]);
+});
+
+test('subscriptions: plan detection, settings validation, and value against the fee', async () => {
+  const { detectPlan, parseSettings, compare } = await import('./subscriptions.js');
+  assert.equal(detectPlan('max', 'default_claude_max_20x')?.listPrice, 200);
+  assert.equal(detectPlan('max', 'default_claude_max_5x')?.key, 'max5x');
+  assert.equal(detectPlan('pro', 'default_claude_ai')?.listPrice, 20);
+  assert.equal(detectPlan(null, null), null);
+
+  assert.ok(parseSettings({ claude: { monthly: -1, currency: 'USD' } }).error);
+  assert.ok(parseSettings({ copilot: { monthly: 10, currency: 'GBP' } }).error);
+  assert.ok(parseSettings({ usdPerEur: 0 }).error);
+  const { settings } = parseSettings({ claude: { monthly: 18, currency: 'EUR' }, copilot: { monthly: 10, currency: 'USD' }, usdPerEur: 1.1 });
+
+  const week = 7 * 86_400_000;
+  const [claude, copilot] = compare(settings, detectPlan('pro', null), week, { claude: 42, copilot: 0 }, { claude: 100, copilot: 5 });
+  assert.equal(claude.label, 'Claude Pro');
+  assert.ok(Math.abs(claude.monthlyUsd - 19.8) < 1e-9);
+  assert.ok(Math.abs(claude.share - 19.8 * 7 / 30) < 1e-9);
+  assert.ok(Math.abs(claude.ratio! - 42 / (19.8 * 7 / 30)) < 1e-9);
+  assert.equal(copilot.ratio30d, 0.5);
+
+  const listOnly = compare({ usdPerEur: 1.1 }, detectPlan('max', 'x_20x'), 30 * 86_400_000, { claude: 400, copilot: 0 }, { claude: 400, copilot: 0 });
+  assert.deepEqual(listOnly.map((x) => [x.priceSource, x.ratio]), [['list', 2]]);
+  assert.deepEqual(compare({ usdPerEur: 1.1, claude: null }, detectPlan('pro', null), week, { claude: 1, copilot: 1 }, { claude: 1, copilot: 1 }), []);
+});
+
+test('review fixes: dated ids stay exact, prefixed list keys match bare ids, feedback on a tool result is a prompt', async () => {
+  const { priceBasis } = await import('./pricing.js');
+  const { parseLiteLlm } = await import('./remote-prices.js');
+  const { applyLine, newFileState } = await import('./collector.js');
+  assert.equal(priceBasis('claude-sonnet-5-20261001'), 'builtin');
+  assert.equal(priceBasis('claude-sonnet-5-7'), 'family');
+
+  const list = parseLiteLlm({ 'gemini/gemini-9-pro': { litellm_provider: 'gemini', input_cost_per_token: 1e-6, output_cost_per_token: 2e-6 } });
+  assert.ok(list.has('gemini-9-pro') && list.has('gemini/gemini-9-pro'));
+
+  const st = newFileState();
+  const head = { sessionId: 's1', cwd: '/p' };
+  applyLine(st, JSON.stringify({ type: 'user', ...head, uuid: 'u0', timestamp: '2026-10-16T10:00:00.000Z', message: { role: 'user', content: 'hi' } }));
+  applyLine(st, JSON.stringify({ parentUuid: 'u0', isSidechain: false, promptId: 'p', type: 'user',
+    message: { role: 'user', content: [{ type: 'tool_result', content: 'x'.repeat(3000) }, { type: 'text', text: 'no, do it differently' }] },
+    uuid: 'u1', timestamp: '2026-10-16T10:00:05.000Z', toolUseResult: 'rejected', ...head }));
+  assert.equal(st.prompts.length, 2);
 });

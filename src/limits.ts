@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { DetectedPlan, detectPlan } from './subscriptions.js';
 
 // Claude plan limits (5h session window, weekly caps) from the endpoint the
 // Claude apps use. It is unofficial and may change, so the response is mapped
@@ -28,6 +29,7 @@ interface Credentials {
   accessToken: string;
   expired: boolean;
   plan: string | null;
+  tier: string | null;
 }
 
 /** Reads the OAuth access token Claude Code stores; never uses or touches the refresh token. */
@@ -38,6 +40,7 @@ export function parseCredentials(json: unknown, nowMs: number): Credentials | nu
     accessToken: oauth.accessToken,
     expired: typeof oauth.expiresAt === 'number' && oauth.expiresAt < nowMs,
     plan: typeof oauth.subscriptionType === 'string' ? oauth.subscriptionType : null,
+    tier: typeof oauth.rateLimitTier === 'string' ? oauth.rateLimitTier : null,
   };
 }
 
@@ -98,10 +101,23 @@ export class LimitsClient {
         headers: { Authorization: `Bearer ${creds.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20' },
         signal: AbortSignal.timeout(10_000),
       });
+      if (res.status === 401 || res.status === 403) {
+        return { ok: false, error: `Claude login was rejected (HTTP ${res.status}). Run any claude command to refresh it.` };
+      }
       if (!res.ok) return { ok: false, error: `Usage endpoint returned HTTP ${res.status}.` };
       return { ok: true, ...normalizeUsage(await res.json(), creds.plan) };
     } catch (err) {
       return { ok: false, error: `Usage endpoint unreachable: ${(err as Error).message}` };
     }
+  }
+}
+
+/** The Claude plan of the signed-in account, from the credentials file; null when unknown. */
+export function readPlan(credentialsPath: string): DetectedPlan | null {
+  try {
+    const creds = parseCredentials(JSON.parse(fs.readFileSync(credentialsPath, 'utf8')), Date.now());
+    return creds ? detectPlan(creds.plan, creds.tier) : null;
+  } catch {
+    return null;
   }
 }

@@ -28,7 +28,7 @@ interface Stats {
   lastHour: { cost: number; requests: number };
   series: { t: number; cost: number; tokens: number; cacheHitRate: number | null; latencyP50: number | null; requests: number }[];
   byTool: (Summary & { tool: Tool; sessions: number; prompts: number })[];
-  byModel: (Summary & { model: string; tool: Tool })[];
+  byModel: (Summary & { model: string; tool: Tool; priceBasis?: 'own' | 'litellm' | 'builtin' | 'family' | null })[];
   byProject: (Summary & { project: string; cwd: string })[];
   sessions: (Summary & {
     tool: Tool; sessionId: string; title: string | null; project: string; cwd: string;
@@ -37,8 +37,22 @@ interface Stats {
   recent: { ts: number; tool: Tool; model: string; project: string; cost: number | null; latencyMs: number | null; tokens: number; cacheHitRate: number | null; sidechain: boolean }[];
   tools: Record<Tool, { available: boolean; error: string | null }>;
   prices?: PricesInfo;
+  subscriptions?: Comparison[];
 }
-interface PricesInfo { asOf: string; file: string; loaded: boolean; overrides: number; errors: string[] }
+interface PricesInfo {
+  asOf: string; file: string; loaded: boolean; overrides: number; errors: string[];
+  remote?: { fetchedAt: number | null; models: number; error: string | null };
+}
+interface Comparison {
+  tool: 'claude' | 'copilot'; label: string; monthly: number; currency: 'USD' | 'EUR'; monthlyUsd: number;
+  priceSource: 'list' | 'own'; share: number; apiCost: number; ratio: number | null; apiCost30d: number; ratio30d: number | null;
+}
+interface SubPrice { monthly: number; currency: 'USD' | 'EUR' }
+interface SettingsResult {
+  ok: boolean; error?: string | null;
+  settings?: { claude?: SubPrice | null; copilot?: SubPrice | null; usdPerEur: number };
+  plan?: { label: string; listPrice: number | null } | null;
+}
 
 interface LimitWindow { kind: string; label: string; percent: number; severity: string; resetsAt: string | null }
 type LimitsResult = { ok: true; plan: string | null; limits: LimitWindow[] } | { ok: false; error: string };
@@ -238,7 +252,9 @@ function renderModels(c: ThemeColors, s: Stats): string {
     ['model', 'requests', 'tokens', 'cache hit', 'p50', 'p95', 'cost'],
     s.byModel.map((m) => [
       `${toolTag(c, m.tool)}${esc(shortModel(m.model))}`, String(m.requests), fmtTokens(m.totalTokens), hit(c, m.cacheHitRate),
-      fmtMs(m.latency.p50), fmtMs(m.latency.p95), m.unpricedRequests === m.requests ? '—' : fmtCost(m.cost),
+      fmtMs(m.latency.p50), fmtMs(m.latency.p95),
+      m.unpricedRequests === m.requests ? '—'
+        : m.tool === 'claude' && m.priceBasis === 'family' ? `<span title="No exact price for this model; priced like its model family">≈${fmtCost(m.cost)}</span>` : fmtCost(m.cost),
     ])));
 }
 
@@ -332,19 +348,100 @@ function renderLimits(c: ThemeColors, l: LimitsResult | null): string {
 
 function renderPriceWarnings(c: ThemeColors, s: Stats): string {
   const unpriced = s.byModel.filter((m) => m.unpricedRequests > 0);
-  const errors = s.prices?.errors ?? [];
-  if (!unpriced.length && !errors.length) return '';
+  const guessed = s.byModel.filter((m) => m.tool === 'claude' && m.priceBasis === 'family' && m.unpricedRequests < m.requests);
+  const errors = [...(s.prices?.errors ?? [])];
+  const remoteError = s.prices?.remote?.error;
+  if (!unpriced.length && !guessed.length && !errors.length && !remoteError) return '';
   const file = esc(s.prices?.file ?? '~/.config/cloudcli-analytics/prices.json');
-  const models = unpriced.map((m) => `${toolTag(c, m.tool)}${esc(m.model)} <span style="color:${c.muted}">(${m.unpricedRequests} req)</span>`).join('<br>');
+  const list = (ms: Stats['byModel']) => ms.map((m) => `${toolTag(c, m.tool)}${esc(m.model)} <span style="color:${c.muted}">(${m.requests} req)</span>`).join('<br>');
   // OpenCode estimates are priced by the bare model id, without the provider prefix.
-  const exampleKey = unpriced[0]?.model.split('/').pop() || 'model-name';
+  const exampleKey = (unpriced[0] ?? guessed[0])?.model.split('/').pop() || 'model-name';
   const example = esc(JSON.stringify({ [exampleKey]: { input: 3, output: 15, cacheRead: 0.3 } }));
   return card(c, 'prices', `<div style="font-size:0.72rem;line-height:1.6">
-    ${unpriced.length ? `<div>No price for these models, so their cost is left out:</div><div style="margin:6px 0">${models}</div>
-      <div style="color:${c.muted}">Add them to <code>${file}</code> in $ per million tokens; cache writes derive from input, cacheRead defaults to 0.1× input:</div>
+    ${unpriced.length ? `<div>No price for these models, so their cost is left out:</div><div style="margin:6px 0">${list(unpriced)}</div>` : ''}
+    ${guessed.length ? `<div>No exact price for these models; they are priced like their model family (≈):</div><div style="margin:6px 0">${list(guessed)}</div>` : ''}
+    ${unpriced.length || guessed.length ? `<div style="color:${c.muted}">Set a price in <code>${file}</code>, $ per million tokens; cache writes derive from input, cacheRead defaults to 0.1× input:</div>
       <code style="display:block;margin-top:4px;color:${c.muted};white-space:pre-wrap;word-break:break-all">${example}</code>` : ''}
     ${errors.map((e) => `<div style="color:${c.warn}">⚠ ${file}: ${esc(e)}</div>`).join('')}
+    ${remoteError ? `<div style="color:${c.warn}">⚠ ${esc(remoteError)} ${pill(c, false, 'prices-refresh', '', 'retry')}</div>` : ''}
   </div>`);
+}
+
+function priceSourceNote(p: PricesInfo | undefined): string {
+  if (!p) return '';
+  const r = p.remote;
+  const own = p.overrides ? `; ${p.overrides} own price${p.overrides === 1 ? '' : 's'} from ${esc(p.file)}` : '';
+  const source = r?.fetchedAt
+    ? `Prices from LiteLLM (${r.models} models, updated ${fmtAgo(r.fetchedAt)}), built-in table as fallback`
+    : `Built-in prices as of ${esc(p.asOf)} (LiteLLM list not loaded yet)`;
+  return ` ${source}${own}. <button data-action="prices-refresh" style="font:inherit;font-size:inherit;background:none;border:none;padding:0;color:inherit;text-decoration:underline;cursor:pointer">update prices</button>`;
+}
+
+// ── Subscriptions ───────────────────────────────────────────────────────
+
+function fmtRatio(r: number | null): string {
+  return r === null ? '—' : `${r >= 10 ? r.toFixed(0) : r.toFixed(1)}×`;
+}
+
+function renderSubscriptions(c: ThemeColors, s: Stats): string {
+  const subs = s.subscriptions ?? [];
+  const edit = pill(c, false, 'subs-edit', '', subs.length ? 'edit' : 'compare with a subscription');
+  if (!subs.length) return `<div style="margin:-4px 0 12px">${edit}</div>`;
+  const rows = subs.map((x) => {
+    const price = `${x.currency === 'EUR' ? '€' : '$'}${x.monthly.toFixed(2)}/mo${x.priceSource === 'list' ? ' (list price)' : ''}`;
+    const color = x.ratio !== null && x.ratio >= 1 ? c.ok : c.muted;
+    return [
+      esc(x.label), price, fmtCost(x.apiCost), fmtCost(x.share),
+      `<span style="color:${color}">${fmtRatio(x.ratio)}</span>`,
+      `${fmtCost(x.apiCost30d)} · ${fmtRatio(x.ratio30d)}`,
+    ];
+  });
+  return card(c, `subscriptions · all projects <span style="float:right;letter-spacing:0">${edit}</span>`, table(c,
+    ['plan', 'fee', `API-equivalent · ${s.range}`, `fee share · ${s.range}`, 'value', 'last 30 days vs 1 month'], rows, 2)
+    + `<div style="font-size:0.62rem;color:${c.muted};margin-top:6px">value = what the requests would have cost at API prices ÷ the share of the fee for this range. Above 1× the subscription pays off.</div>`);
+}
+
+function renderSubscriptionForm(c: ThemeColors, r: SettingsResult | null): string {
+  if (!r) return card(c, 'subscriptions', empty(c, 'loading…'));
+  const st = r.settings ?? { usdPerEur: 1.1 };
+  const plan = r.plan;
+  const mode = st.claude === null ? 'off' : st.claude ? 'own' : 'list';
+  const input = (name: string, value: string, attrs = '') =>
+    `<input name="${name}" value="${esc(value)}" ${attrs} style="font:inherit;font-size:0.72rem;width:90px;padding:2px 4px;background:${c.bg};color:${c.text};border:1px solid ${c.border};border-radius:2px">`;
+  const select = (name: string, value: string, options: [string, string][]) =>
+    `<select name="${name}" style="font:inherit;font-size:0.72rem;background:${c.bg};color:${c.text};border:1px solid ${c.border};border-radius:2px">${
+      options.map(([v, l]) => `<option value="${v}" ${v === value ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
+  const row = (label: string, body: string) => `<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px"><span style="width:110px;color:${c.muted}">${label}</span>${body}</div>`;
+  const listLabel = plan ? `${plan.label}${plan.listPrice !== null ? ` list price $${plan.listPrice}` : ' (no list price)'}` : 'detected plan (none found)';
+  return card(c, 'subscriptions', `<form data-form="subs" style="font-size:0.72rem">
+    ${row('Claude', `${select('claudeMode', mode, [['list', listLabel], ['own', 'my price'], ['off', "don't compare"]])}
+      ${input('claudeMonthly', st.claude ? String(st.claude.monthly) : '', 'type="number" min="0" step="0.01" placeholder="per month"')}
+      ${select('claudeCurrency', st.claude?.currency ?? 'USD', [['USD', 'USD'], ['EUR', 'EUR']])}`)}
+    ${row('GitHub Copilot', `${input('copilotMonthly', st.copilot ? String(st.copilot.monthly) : '', 'type="number" min="0" step="0.01" placeholder="e.g. 10 or 39"')}
+      ${select('copilotCurrency', st.copilot?.currency ?? 'USD', [['USD', 'USD'], ['EUR', 'EUR']])}
+      <span style="color:${c.muted}">empty = don't compare</span>`)}
+    ${row('1 EUR =', `${input('usdPerEur', String(st.usdPerEur), 'type="number" min="0.01" step="0.01"')} USD <span style="color:${c.muted}">(your estimate, used for EUR prices)</span>`)}
+    <div data-error style="color:${c.warn};margin-top:8px">${r.error ? `⚠ ${esc(r.error)}` : ''}</div>
+    <div style="display:flex;gap:6px;margin-top:12px">
+      <button type="submit" style="font:inherit;font-size:0.68rem;padding:3px 9px;border-radius:3px;border:1px solid ${c.accent};background:${c.accent};color:${c.bg};cursor:pointer">save</button>
+      ${pill(c, false, 'subs-cancel', '', 'cancel')}
+    </div>
+  </form>`);
+}
+
+/** Builds the settings body from the form; the server validates it again. */
+function settingsFromForm(form: HTMLFormElement): unknown {
+  const f = new FormData(form);
+  const price = (monthly: FormDataEntryValue | null, currency: FormDataEntryValue | null) =>
+    String(monthly ?? '').trim() === '' ? null : { monthly: Number(monthly), currency: String(currency) };
+  const mode = String(f.get('claudeMode'));
+  const body: Record<string, unknown> = {
+    usdPerEur: Number(f.get('usdPerEur')),
+    copilot: price(f.get('copilotMonthly'), f.get('copilotCurrency')),
+  };
+  if (mode === 'off') body.claude = null;
+  else if (mode === 'own') body.claude = price(f.get('claudeMonthly'), f.get('claudeCurrency')) ?? { monthly: NaN, currency: 'USD' };
+  return body;
 }
 
 // ── Session health (PRISM) ──────────────────────────────────────────────
@@ -528,6 +625,8 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
   let healthSeq = 0;
   /** Project the shown health report belongs to ('' = all projects). */
   let healthFor: string | null = null;
+  /** Subscription form: null while closed; polling pauses while it is open so re-renders keep the inputs. */
+  let subsForm: { result: SettingsResult | null } | null = null;
   let error: string | null = null;
   let loading = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -538,6 +637,8 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
   container.appendChild(root);
 
   function render(): void {
+    // A rebuild would reset what the user is typing; the next render after closing catches up.
+    if (subsForm?.result && root.querySelector('form[data-form="subs"]')) return;
     const ctx = api.context;
     const c = themeColors(ctx.theme === 'dark');
     root.style.cssText = `font-family:${MONO};background:${c.bg};color:${c.text};padding:18px;min-height:100%;box-sizing:border-box;overflow:auto;height:100%`;
@@ -558,11 +659,8 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     }
     if (view.tool !== 'opencode') body += renderLimits(c, limits);
     if (stats) {
-      const p = stats.prices;
-      const priceNote = p
-        ? ` Built-in prices as of ${esc(p.asOf)}${p.overrides ? `; ${p.overrides} own price${p.overrides === 1 ? '' : 's'} from ${esc(p.file)}` : ''}.`
-        : '';
-      body += renderTiles(c, stats) + renderPriceWarnings(c, stats) + renderCharts(c, stats) + renderTools(c, stats) + renderSessions(c, stats, sessionKey(ctx))
+      const priceNote = priceSourceNote(stats.prices);
+      body += renderTiles(c, stats) + (subsForm ? renderSubscriptionForm(c, subsForm.result) : renderSubscriptions(c, stats)) + renderPriceWarnings(c, stats) + renderCharts(c, stats) + renderTools(c, stats) + renderSessions(c, stats, sessionKey(ctx))
         + `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:0 12px">${renderModels(c, stats)}${renderProjects(c, stats)}</div>`
         + renderRecent(c, stats)
         + `<div style="font-size:0.6rem;color:${c.muted};margin-top:4px">Claude Code costs are estimates from public per-token prices.${priceNote} OpenCode costs are OpenCode's own per-message figures; for GitHub Copilot these are API-equivalent, since Copilot bills by subscription and premium requests ("prompts"). "reported" is each tool's own session counter (Claude Code's resets on resume). Latency = request sent → first response block written. Plan limits come from Anthropic's usage endpoint with your Claude login; everything else is read locally (~/.claude/projects, ~/.local/share/opencode).</div>`;
@@ -574,7 +672,7 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
   function schedule(): void {
     if (timer) clearTimeout(timer);
     timer = null;
-    if (alive && view.page === 'usage' && view.intervalMs > 0) timer = setTimeout(load, view.intervalMs);
+    if (alive && view.page === 'usage' && !subsForm && view.intervalMs > 0) timer = setTimeout(load, view.intervalMs);
   }
 
   async function load(): Promise<void> {
@@ -656,6 +754,29 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
       case 'prism-refresh':
         void loadHealth(true);
         return;
+      case 'prices-refresh':
+        void (api.rpc('POST', '/prices/refresh') as Promise<unknown>).catch(() => undefined).then(() => load());
+        return;
+      case 'subs-edit': {
+        const form: { result: SettingsResult | null } = { result: null };
+        subsForm = form;
+        if (timer) clearTimeout(timer);
+        timer = null;
+        render();
+        void (api.rpc('GET', '/settings') as Promise<SettingsResult>)
+          .catch((err: Error): SettingsResult => ({ ok: false, error: err.message }))
+          .then((r) => {
+            if (subsForm !== form) return;
+            form.result = r;
+            render();
+          });
+        return;
+      }
+      case 'subs-cancel':
+        subsForm = null;
+        render();
+        void load();
+        return;
       case 'range':
         view.range = value as Range;
         stats = null;
@@ -687,7 +808,29 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     }
   }
 
+  function onSubmit(e: Event): void {
+    const form = e.target as HTMLFormElement;
+    e.preventDefault();
+    if (form.dataset.form !== 'subs' || !subsForm) return;
+    const current = subsForm;
+    void (api.rpc('PUT', '/settings', settingsFromForm(form)) as Promise<SettingsResult>)
+      .catch((err: Error): SettingsResult => ({ ok: false, error: err.message }))
+      .then((r) => {
+        if (subsForm !== current) return;
+        if (r.ok) {
+          subsForm = null;
+          render();
+          void load();
+          return;
+        }
+        // Show the message in place, without re-rendering, so the entered values stay.
+        const slot = form.querySelector('[data-error]');
+        if (slot) slot.textContent = `⚠ ${r.error ?? 'Could not save'}`;
+      });
+  }
+
   root.addEventListener('click', onClick);
+  root.addEventListener('submit', onSubmit);
   document.addEventListener('visibilitychange', onVisibility);
   const unsub = api.onContextChange(() => {
     if (view.scope === 'project' && !api.context.project) view.scope = 'all';
@@ -709,6 +852,7 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     alive = false;
     if (timer) clearTimeout(timer);
     root.removeEventListener('click', onClick);
+    root.removeEventListener('submit', onSubmit);
     document.removeEventListener('visibilitychange', onVisibility);
     unsub();
   };
